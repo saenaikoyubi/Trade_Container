@@ -1,0 +1,46 @@
+{
+  "exchanges": {
+    "bybit": {
+      "adapter": "ccxt",
+      "options": {
+        "defaultType": "linear"
+      },
+      "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+      "fees": {
+        "maker": "0.0002",
+        "taker": "0.00055"
+      }
+    },
+    "binance": {
+      "adapter": "ccxt",
+      "symbols": ["BTC/USDT"],
+      "fees": {
+        "maker": "0.0025",
+        "taker": "0.0040"
+      }
+    },
+    "dydx": {
+      "adapter": "dydx",
+      "symbols": ["ETH-USD", "BTC-USD"],
+      "fees": {
+        "maker": "0.0025",
+        "taker": "0.0040"
+      }
+    }
+  },
+  "poll_interval_seconds": 1.0,
+  "market_data_max_age_seconds": 10.0,
+  "account": {
+    "currency": "USDT",
+    "initial_balance": "10000.0",
+    "default_leverage": "10.0"
+  },
+  "risk": {
+    "max_order_quantity": "10.0",
+    "max_order_notional": "50000.0",
+    "max_position_notional": "100000.0",
+    "max_daily_loss": "5000.0",
+    "max_price_deviation_pct": "0.05",
+    "max_orders_per_minute": 60
+  }
+}

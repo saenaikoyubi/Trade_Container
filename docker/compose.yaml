@@ -1,0 +1,229 @@
+name: trade-container
+
+x-app-environment: &app-environment
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: trade
+  POSTGRES_USER: trade
+  DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+  TRADE_CONFIG_FILE: /app/config/settings.json
+  HOME: /tmp
+
+x-app-security: &app-security
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+
+x-database-secret: &database-secret
+  type: bind
+  source: "${TRADE_SECRETS_DIR:?TRADE_SECRETS_DIR must be set}/local/database/postgres_password"
+  target: /run/secrets/postgres_password
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-api-secret: &api-secret
+  type: bind
+  source: "${TRADE_SECRETS_DIR:?TRADE_SECRETS_DIR must be set}/local/trade-api/api_token"
+  target: /run/api-secrets/api_token
+  read_only: true
+  bind:
+    create_host_path: false
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: postgres/Dockerfile
+    environment:
+      POSTGRES_DB: trade
+      POSTGRES_USER: trade
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./postgres/volume/data:/var/lib/postgresql/data
+      - ./postgres/volume/logs:/var/log/postgresql
+      - *database-secret
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trade -d trade"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - backend
+
+  db-migrate:
+    build:
+      context: .
+      dockerfile: db-migrate/Dockerfile
+    environment: *app-environment
+    volumes:
+      - ./db-migrate/volume/logs:/app/var/log
+      - *database-secret
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - backend
+
+  trade-api:
+    build:
+      context: .
+      dockerfile: trade-api/Dockerfile
+    <<: *app-security
+    environment:
+      <<: *app-environment
+      API_TOKEN_FILE: /run/api-secrets/api_token
+      LOG_DIR: /app/var/log
+    volumes:
+      - ./trade-api/volume/logs:/app/var/log
+      - *api-secret
+      - *database-secret
+      - ./share/volume/config:/app/config:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - backend
+      - api
+      - exchange
+
+  trade-ui:
+    build:
+      context: .
+      dockerfile: trade-ui/Dockerfile
+    <<: *app-security
+    environment:
+      TRADE_API_BASE_URL: http://trade-api:8000
+      API_TOKEN_FILE: /run/api-secrets/api_token
+    volumes:
+      - *api-secret
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      trade-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - api
+
+  paper-executor:
+    build:
+      context: .
+      dockerfile: paper-executor/Dockerfile
+    <<: *app-security
+    environment:
+      <<: *app-environment
+      LOG_DIR: /app/var/log
+    volumes:
+      - ./paper-executor/volume/logs:/app/var/log
+      - *database-secret
+      - ./share/volume/config:/app/config:ro
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks:
+      - backend
+      - exchange
+
+  db-backup:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: db-backup/Dockerfile
+    environment: *app-environment
+    volumes:
+      - ./db-backup/volume/output:/backup
+      - *database-secret
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - backend
+
+  postgres-restore:
+    profiles: ["restore"]
+    build:
+      context: .
+      dockerfile: postgres/Dockerfile
+    environment:
+      POSTGRES_DB: trade_restore
+      POSTGRES_USER: trade
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - *database-secret
+    tmpfs:
+      - /var/lib/postgresql/data:size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trade -d trade_restore"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    restart: "no"
+    networks:
+      - restore-backend
+
+  db-restore:
+    profiles: ["restore"]
+    build:
+      context: .
+      dockerfile: db-restore/Dockerfile
+    <<: *app-security
+    environment:
+      POSTGRES_HOST: postgres-restore
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: trade_restore
+      POSTGRES_USER: trade
+      DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+      BACKUP_FILE: ${BACKUP_FILE:-}
+      RESTORE_CONFIRM: ${RESTORE_CONFIRM:-}
+    volumes:
+      - ./db-backup/volume/output:/backup:ro
+      - *database-secret
+    depends_on:
+      postgres-restore:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - restore-backend
+
+  test:
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: test/Dockerfile
+    environment:
+      PYTHONPATH: /app
+    restart: "no"
+
+networks:
+  backend:
+    internal: true
+  api:
+  exchange:
+  restore-backend:
+    internal: true

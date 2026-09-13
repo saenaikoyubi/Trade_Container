@@ -1,0 +1,7 @@
+ccxt==4.4.92
+dydx-v4-client==1.1.6
+fastapi==0.115.14
+psycopg[binary]==3.2.9
+pydantic==2.11.7
+SQLAlchemy==2.0.41
+uvicorn==0.34.3

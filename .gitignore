@@ -1,0 +1,27 @@
+# Local editor/agent state
+.obsidian/
+.agents/
+
+# Docker bind-mount runtime data
+/docker/**/volume/logs/*
+!/docker/**/volume/logs/.gitkeep
+/docker/**/volume/data/*
+!/docker/**/volume/data/.gitkeep
+/docker/**/volume/output/*
+!/docker/**/volume/output/.gitkeep
+
+# Secrets: keep documentation and examples only
+/.secrets/
+/docker/**/volume/secrets/*
+!/docker/**/volume/secrets/README.md
+!/docker/**/volume/secrets/*.example
+
+# Python generated files
+**/__pycache__/
+**/.pytest_cache/
+**/*.py[cod]
+
+# Secret files
+**/.env
+/.env.local
+/.env.*.local

@@ -1,0 +1,6 @@
+**/volume/**
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc
+**/*.pyo
+**/.env

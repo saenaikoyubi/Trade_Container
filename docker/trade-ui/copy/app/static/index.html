@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Trade Ledger | 取引履歴</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">TL</span>
+        <div>
+          <p class="eyebrow">TRADE CONTAINER</p>
+          <h1>Trade Ledger</h1>
+        </div>
+      </div>
+      <div id="mode-badge" class="mode-badge normal"><span aria-hidden="true"></span>状態取得中</div>
+    </header>
+
+    <main>
+      <section class="trade-card" aria-labelledby="trade-title">
+        <div class="section-heading trade-heading">
+          <div>
+            <p class="eyebrow">PAPER ORDER</p>
+            <h2 id="trade-title">手動注文</h2>
+          </div>
+          <div class="control-actions">
+            <label class="control-reason">
+              <span>切替理由</span>
+              <input id="control-reason" type="text" maxlength="500" placeholder="テスト停止、緊急決済など">
+            </label>
+            <button id="close-only-toggle" class="warning-button" type="button">Close-onlyを有効化</button>
+          </div>
+        </div>
+        <p id="control-message" class="operation-message" role="status"></p>
+
+        <form id="order-form" class="order-form">
+          <label>
+            <span>取引所</span>
+            <select id="order-exchange" required>
+              <option value="">選択してください</option>
+            </select>
+          </label>
+          <label>
+            <span>銘柄</span>
+            <select id="order-symbol" required disabled>
+              <option value="">取引所を先に選択</option>
+            </select>
+          </label>
+          <label>
+            <span>売買</span>
+            <select id="order-side" required>
+              <option value="buy">買い</option>
+              <option value="sell">売り</option>
+            </select>
+          </label>
+          <label>
+            <span>注文種別</span>
+            <select id="order-type" required>
+              <option value="market">成行</option>
+              <option value="limit">指値</option>
+            </select>
+          </label>
+          <label>
+            <span>数量</span>
+            <input id="order-quantity" type="number" min="0" step="any" inputmode="decimal" required>
+          </label>
+          <label>
+            <span>指値価格</span>
+            <input id="order-limit-price" type="number" min="0" step="any" inputmode="decimal" disabled>
+          </label>
+          <label class="checkbox-label">
+            <input id="order-reduce-only" type="checkbox">
+            <span>Reduce-only</span>
+          </label>
+          <button id="order-submit" class="primary-button" type="submit">注文内容を確認</button>
+        </form>
+        <p id="order-message" class="operation-message" role="status"></p>
+      </section>
+
+      <section class="filter-panel" aria-labelledby="filter-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">HISTORY RANGE</p>
+            <h2 id="filter-title">表示期間</h2>
+          </div>
+          <p id="last-updated" class="last-updated">未更新</p>
+        </div>
+
+        <form id="filter-form" class="filters">
+          <label>
+            <span>開始日 <small>UTC</small></span>
+            <input id="from-date" name="from" type="date">
+          </label>
+          <label>
+            <span>終了日 <small>UTC</small></span>
+            <input id="to-date" name="to" type="date">
+          </label>
+          <label>
+            <span>取引所</span>
+            <select id="exchange-id" name="exchange_id">
+              <option value="">すべて</option>
+            </select>
+          </label>
+          <label>
+            <span>銘柄</span>
+            <input id="symbol" name="symbol" type="text" placeholder="BTC/USDT" autocomplete="off">
+          </label>
+          <label>
+            <span>戦略ID</span>
+            <input id="strategy-id" name="strategy_id" type="text" maxlength="64" placeholder="manual" autocomplete="off">
+          </label>
+          <label>
+            <span>売買</span>
+            <select id="side" name="side">
+              <option value="">すべて</option>
+              <option value="buy">買い</option>
+              <option value="sell">売り</option>
+            </select>
+          </label>
+          <label>
+            <span>注文状態</span>
+            <select id="status" name="status">
+              <option value="">すべて</option>
+              <option value="pending">受付済み</option>
+              <option value="processing">処理中</option>
+              <option value="open">未約定</option>
+              <option value="partially_filled">一部約定</option>
+              <option value="filled">約定済み</option>
+              <option value="canceled">取消済み</option>
+              <option value="rejected">拒否</option>
+              <option value="failed">失敗</option>
+            </select>
+          </label>
+          <button class="primary-button" type="submit">表示を更新</button>
+        </form>
+
+        <div class="quick-ranges" aria-label="期間のクイック選択">
+          <span>クイック選択</span>
+          <button type="button" data-range="7">7日</button>
+          <button type="button" data-range="30" class="active">30日</button>
+          <button type="button" data-range="90">90日</button>
+          <button type="button" data-range="all">全期間</button>
+        </div>
+      </section>
+
+      <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+      <section class="current-card" aria-labelledby="current-title">
+        <div class="section-heading current-heading">
+          <div>
+            <p class="eyebrow">CURRENT POSITIONS</p>
+            <h2 id="current-title">現在の建玉と未実現損益</h2>
+          </div>
+          <div class="current-actions">
+            <div class="profit-summary">
+              <span>合計未実現損益</span>
+              <strong id="unrealized-total">—</strong>
+            </div>
+            <button id="close-all" class="danger-button" type="button" disabled>表示取引所を全決済</button>
+            <button id="current-refresh" class="secondary-button" type="button">現在値を更新</button>
+          </div>
+        </div>
+        <div class="current-meta">
+          <span id="current-updated">「現在値を更新」を押すと市場価格を取得します</span>
+          <span>建玉は保存済みデータ、現在価格は注文板の中間価格</span>
+        </div>
+        <div id="current-error" class="current-error" role="alert" hidden></div>
+        <div class="table-scroll current-table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>取引所／銘柄</th><th>建玉方向</th><th class="numeric">数量</th>
+                <th class="numeric">平均取得価格</th><th class="numeric">現在価格</th>
+                <th class="numeric">未実現損益</th><th>価格取得時刻</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="current-positions-body"></tbody>
+          </table>
+        </div>
+        <div id="current-positions-empty" class="table-empty">現在値はまだ取得されていません</div>
+      </section>
+
+      <section class="history-card" aria-labelledby="history-title">
+        <div class="history-header">
+          <div>
+            <p class="eyebrow">LEDGER</p>
+            <h2 id="history-title">取引履歴</h2>
+          </div>
+          <div class="tabs" role="tablist" aria-label="履歴種別">
+            <button id="orders-tab" role="tab" aria-selected="true" aria-controls="orders-panel">注文</button>
+            <button id="fills-tab" role="tab" aria-selected="false" aria-controls="fills-panel">約定</button>
+          </div>
+        </div>
+
+        <div id="orders-panel" role="tabpanel" aria-labelledby="orders-tab">
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>日時</th><th>取引所</th><th>銘柄</th><th>売買</th><th>注文</th><th class="numeric">数量</th>
+                  <th class="numeric">約定数量</th><th class="numeric">平均価格</th><th>状態</th>
+                </tr>
+              </thead>
+              <tbody id="orders-body"></tbody>
+            </table>
+          </div>
+          <div id="orders-empty" class="table-empty" hidden>該当する注文履歴はありません</div>
+          <div class="load-more"><button id="orders-more" type="button" hidden>さらに読み込む</button></div>
+        </div>
+
+        <div id="fills-panel" role="tabpanel" aria-labelledby="fills-tab" hidden>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>日時</th><th>取引所</th><th>銘柄</th><th>売買</th><th class="numeric">数量</th>
+                  <th class="numeric">価格</th><th class="numeric">約定金額</th><th class="numeric">手数料</th><th>流動性</th>
+                </tr>
+              </thead>
+              <tbody id="fills-body"></tbody>
+            </table>
+          </div>
+          <div id="fills-empty" class="table-empty" hidden>該当する約定履歴はありません</div>
+          <div class="load-more"><button id="fills-more" type="button" hidden>さらに読み込む</button></div>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="order-dialog" class="order-dialog">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">ORDER DETAIL</p>
+          <h2>注文詳細</h2>
+        </div>
+        <button id="dialog-close" class="icon-button" type="button" aria-label="詳細を閉じる">×</button>
+      </div>
+      <div id="order-detail"></div>
+      <div class="dialog-actions">
+        <button id="order-cancel" class="danger-button" type="button" hidden>この注文を取り消す</button>
+      </div>
+      <div class="dialog-section">
+        <h3>関連約定</h3>
+        <div id="order-fills" class="related-fills"></div>
+      </div>
+    </dialog>
+  </body>
+</html>
