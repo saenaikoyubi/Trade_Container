@@ -5,7 +5,7 @@
 - [移行・改修計画](migration.md): 受入調査で確認したギャップ、合意仕様、Gate条件
 - [実装計画](implementation_plan.md): grillingで確定した設計判断、実装フェーズ、完了証跡
 
-現在の仕様は[システム設計](../architecture.md)、[取引・執行仕様](../trading-engine.md)、[API仕様](../api.md)、[Quickstart](../quickstart.md)、[DB運用手順](../database.md)を参照してください。
+現在の仕様と実装前の目標仕様は[システム設計](../architecture.md)、[取引・執行仕様](../trading-engine.md)、[API仕様](../api.md)、[Bybit 動的銘柄対応](../bybit-dynamic-symbols.md)、[Quickstart](../quickstart.md)、[DB運用手順](../database.md)を参照してください。
 
 ## 完了時点の検証
 

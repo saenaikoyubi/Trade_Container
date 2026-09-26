@@ -2,6 +2,9 @@
 
 公開市場データを参照して約定シミュレーションを行う、Paper取引専用のDocker基盤です。注文ごとの `exchange_id` でCCXT対応取引所（Binance, Bybit等）またはdYdXへ振り分けます。実取引所への発注、取消、残高照会、認証情報の読込は一切行いません。
 
+> [!NOTE]
+> 設定外 Bybit USDT Linear Perpetual 銘柄、停止銘柄のMark Price決済、分割全決済、Kill Switchによる受付停止・取消、および[API仕様](docs/api.md)で定義した既存エンドポイントの契約変更は合意済みの目標仕様で、現行コードには未反映の部分があります。[Bybit 動的銘柄対応](docs/bybit-dynamic-symbols.md)にBybit機能の受入条件をまとめています。
+
 ## 構成
 
 - `trade-api`: 注文受付、取消・全決済要求、履歴・ポジション・損益照会、銘柄メタデータ・リアルタイム価格・口座残高照会、Close-only、Kill Switch
@@ -18,6 +21,6 @@
 - [システム設計](docs/architecture.md)
 - [取引・執行仕様](docs/trading-engine.md)
 - [API仕様](docs/api.md)
+- [Bybit 動的銘柄対応](docs/bybit-dynamic-symbols.md)
 - [Quickstart & 操作ガイド](docs/quickstart.md)
 - [DB運用手順](docs/database.md)
-- [移行・実装履歴](docs/archive/README.md)
