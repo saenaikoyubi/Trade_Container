@@ -3,9 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import math
 from typing import Any, Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, literal, select
 from sqlalchemy.orm import Session
 
 from .config import Settings
@@ -59,21 +60,40 @@ def order_book_midpoint(
     now: datetime,
     max_age_seconds: float,
 ) -> tuple[Decimal, datetime]:
-    duration = float(book.get("_request_duration_seconds") or 0)
+    if not isinstance(book, dict):
+        raise ValuationError("order book is invalid")
+    try:
+        duration = float(book.get("_request_duration_seconds") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValuationError("market data request duration is invalid") from exc
+    if not math.isfinite(duration) or duration < 0:
+        raise ValuationError("market data request duration is invalid")
     if duration > max_age_seconds:
         raise ValuationError("market data request was too slow")
 
     bids = book.get("bids") or []
     asks = book.get("asks") or []
+    if not isinstance(bids, (list, tuple)) or not isinstance(asks, (list, tuple)):
+        raise ValuationError("order book levels are invalid")
     if not bids or not asks:
         raise ValuationError("order book is empty")
-    try:
-        best_bid = Decimal(str(bids[0][0]))
-        best_ask = Decimal(str(asks[0][0]))
-    except (IndexError, InvalidOperation, TypeError, ValueError) as exc:
-        raise ValuationError("order book has an invalid price") from exc
-    if not best_bid.is_finite() or not best_ask.is_finite() or best_bid <= 0 or best_ask <= 0:
-        raise ValuationError("order book has an invalid price")
+    for side, levels in (("bids", bids), ("asks", asks)):
+        previous = None
+        for level in levels:
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                raise ValuationError("order book has an invalid level")
+            try:
+                price = Decimal(str(level[0]))
+                quantity = Decimal(str(level[1]))
+            except (IndexError, InvalidOperation, TypeError, ValueError) as exc:
+                raise ValuationError("order book has an invalid level") from exc
+            if not price.is_finite() or not quantity.is_finite() or price <= 0 or quantity <= 0:
+                raise ValuationError("order book has an invalid level")
+            if previous is not None and ((side == "bids" and price > previous) or (side == "asks" and price < previous)):
+                raise ValuationError("order book levels are not in price order")
+            previous = price
+    best_bid = Decimal(str(bids[0][0]))
+    best_ask = Decimal(str(asks[0][0]))
     if best_ask < best_bid:
         raise ValuationError("order book is crossed")
 
@@ -95,7 +115,10 @@ def order_book_midpoint(
         if observed_at.tzinfo is None:
             observed_at = observed_at.replace(tzinfo=timezone.utc)
 
-    if (now - observed_at).total_seconds() > max_age_seconds:
+    age_seconds = (now - observed_at).total_seconds()
+    if age_seconds < -2:
+        raise ValuationError("market data timestamp is too far in the future")
+    if age_seconds > max_age_seconds:
         raise ValuationError("market data is stale")
     return (best_bid + best_ask) / Decimal("2"), observed_at
 
@@ -111,29 +134,43 @@ def unrealized_pnl(quantity: Decimal, average_entry_price: Decimal, current_pric
 def calculate_account_balance(session: Session, config: Settings, adapter_pool) -> AccountBalance:
     if config.account.currency not in {"USD", "USDC", "USDT"}:
         raise ValuationError(f"unsupported account currency: {config.account.currency}")
-    positions = list(session.scalars(select(Position).where(Position.quantity != 0)).all())
-    realized = Decimal(
-        session.scalar(select(func.coalesce(func.sum(DailyPnl.realized_pnl), 0))) or 0
-    )
-    total_fee = Decimal(session.scalar(select(func.coalesce(func.sum(Fill.fee), 0))) or 0)
+    # One SQL statement gives all ledger components the same committed snapshot
+    # under PostgreSQL READ COMMITTED. The later public market-data requests
+    # hold no row locks on these ledger tables.
+    anchor = select(literal(1).label("anchor")).subquery()
+    realized_total = select(func.coalesce(func.sum(DailyPnl.realized_pnl), 0)).scalar_subquery()
+    fee_total = select(func.coalesce(func.sum(Fill.fee), 0)).scalar_subquery()
+    rows = session.execute(
+        select(Position, realized_total, fee_total)
+        .select_from(anchor)
+        .outerjoin(Position, Position.quantity != 0)
+    ).all()
+    positions = [
+        (item.exchange_id, item.symbol, Decimal(item.quantity), Decimal(item.average_entry_price))
+        for item, _, _ in rows if item is not None
+    ]
+    realized = Decimal(rows[0][1] or 0)
+    total_fee = Decimal(rows[0][2] or 0)
     total_unrealized = Decimal("0")
     used_margin = Decimal("0")
     allowed_stablecoins = {"USD", "USDC", "USDT"}
 
-    grouped: dict[str, list[Position]] = {}
-    for position in positions:
-        grouped.setdefault(position.exchange_id, []).append(position)
+    grouped: dict[str, list[tuple[str, Decimal, Decimal]]] = {}
+    for exchange_id, symbol, quantity, entry in positions:
+        grouped.setdefault(exchange_id, []).append((symbol, quantity, entry))
 
     for exchange_id, exchange_positions in grouped.items():
         try:
             adapter = adapter_pool.get(exchange_id)
         except Exception as exc:
             raise ValuationError(f"market data is unavailable for {exchange_id}") from exc
-        for position in exchange_positions:
+        for symbol, quantity, entry in exchange_positions:
             try:
-                instrument = adapter.fetch_instruments(position.symbol)[0]
+                instrument = adapter.fetch_instruments(symbol)[0]
             except Exception as exc:
-                raise ValuationError(f"instrument metadata is unavailable for {exchange_id} {position.symbol}") from exc
+                raise ValuationError(f"instrument metadata is unavailable for {exchange_id} {symbol}") from exc
+            if instrument.get("metadata_stale"):
+                raise ValuationError(f"instrument metadata is stale for {exchange_id} {symbol}")
             settle_asset = str(
                 instrument.get("settle_asset")
                 or (instrument.get("quote_asset") if exchange_id != "bybit" else None)
@@ -141,20 +178,18 @@ def calculate_account_balance(session: Session, config: Settings, adapter_pool) 
             )
             if settle_asset not in allowed_stablecoins:
                 raise ValuationError(
-                    f"unsupported settlement currency for {exchange_id} {position.symbol}: {settle_asset or 'unknown'}"
+                    f"unsupported settlement currency for {exchange_id} {symbol}: {settle_asset or 'unknown'}"
                 )
             try:
                 if exchange_id == "bybit":
-                    price, _ = fresh_mark_price(adapter, position.symbol)
+                    price, _ = fresh_mark_price(adapter, symbol)
                 else:
-                    price_item = adapter.fetch_prices([position.symbol])[0]
+                    price_item = adapter.fetch_prices([symbol])[0]
                     price = positive_decimal(price_item.get("mid_price"))
             except Exception as exc:
-                raise ValuationError(f"market price is unavailable for {exchange_id} {position.symbol}") from exc
+                raise ValuationError(f"market price is unavailable for {exchange_id} {symbol}") from exc
             if price is None or not price.is_finite() or price <= 0:
-                raise ValuationError(f"market price is unavailable for {exchange_id} {position.symbol}")
-            quantity = Decimal(position.quantity)
-            entry = Decimal(position.average_entry_price)
+                raise ValuationError(f"market price is unavailable for {exchange_id} {symbol}")
             total_unrealized += unrealized_pnl(quantity, entry, price)
             used_margin += abs(quantity) * price / config.account.default_leverage
 

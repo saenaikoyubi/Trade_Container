@@ -8,7 +8,7 @@
 |---|---|
 | REST APIの入力、応答、エラー、履歴検索 | [API仕様](api.md) |
 | Bybit 設定外銘柄への対応の概要・受入条件 | [Bybit 動的銘柄対応](bybit-dynamic-symbols.md) |
-| 注文状態遷移、再試行、リスク・約定・評価計算 | [取引・執行仕様](trading-engine.md) |
+| 対象市場、数量・価格制約、注文状態遷移、再試行、リスク・約定・評価計算 | [取引・執行仕様](trading-engine.md) |
 | DBの不変条件、マイグレーション、バックアップ | [DB運用手順](database.md) |
 | 起動、設定、監視、障害時の操作 | [Quickstart & 操作ガイド](quickstart.md) |
 
@@ -31,18 +31,19 @@ flowchart LR
 | サービス | 役割 | 公開ポート |
 |---|---|---|
 | `trade-api` | 注文受付、取消・全決済、照会、取引制御（Close-only / Kill Switch）、銘柄メタデータ・リアルタイム価格・口座残高のオンデマンド提供 | `127.0.0.1:8000` |
-| `trade-ui` | 手動注文、ポジション全決済、注文取消、状態確認（`trade-api` へのリバースプロキシ）。※Bot稼働中は手動発注を行わず、緊急時の確認・全決済用として運用 | `127.0.0.1:8080` |
+| `trade-ui` | パスワードログイン、手動注文、v2増分方式によるポジション全決済、注文取消、状態確認（`trade-api` へのリバースプロキシ）。※Bot稼働中は手動発注を行わず、緊急時の確認・全決済用として運用 | `127.0.0.1:8080` |
 | `paper-executor` | 公開注文板取得、リスク検査、約定処理、ポジション・損益更新 | 非公開 |
 | `postgres` | 注文、約定、ポジション、損益、制御状態の永続化 | 非公開 |
 | `db-migrate` | 起動時スキーママイグレーション | 非公開 |
 | `db-backup` | DBダンプ作成（`tools` プロファイル） | 非公開 |
 | `db-restore` | 隔離環境でのリストア検証（`restore` プロファイル） | 非公開 |
+| `test` / `postgres-test` | SQLite回帰テストに加え、隔離PostgreSQL 17での並行処理・復元検証（`tools` プロファイル） | 非公開 |
 
 ## 2. セキュリティ & 配置方針
 
 - **ネットワーク隔離**: ホストへ公開するのは `trade-api` と `trade-ui` のみ（`127.0.0.1` バインド）。`postgres` と `paper-executor` は内部ネットワーク内でのみ通信。
-- **認証**: `trade-api` は Bearer トークン認証を要求。`trade-ui` はブラウザにトークンを露出せず、サーバーサイドで中継。
-- **秘密情報**: DBパスワードとAPIトークンのみを `TRADE_SECRETS_DIR` から読み取り専用マウント。取引所のAPIキーや秘密鍵は一切使用・保持しない。
+- **認証**: `trade-api` は Bearer トークン認証を要求。`trade-ui` は別のUIパスワードから1時間の署名付きセッションを発行し、全UI APIの照会・変更にログインを要求します。変更操作はCSRFトークンでも保護します。APIトークンはブラウザに露出せず、UIサーバーが中継します。
+- **秘密情報**: DBパスワード、APIトークン、UIパスワード、UIセッション署名鍵を `TRADE_SECRETS_DIR` から読み取り専用マウント。取引所のAPIキーや秘密鍵は一切使用・保持しない。
 - **コンテナ権限**: 非rootユーザー実行、read-only root filesystem、ケーパビリティ制限。
 - **運用分離**: 単一スタック（`compose.yaml`）で Bot 専用運用とし、手動UIは緊急用として分離。
 
@@ -64,6 +65,7 @@ PostgreSQL を注文ワークキューおよび状態管理として利用しま
 
 - 金額・数量・損益・手数料はすべて `NUMERIC`（Decimal）、日時はすべて `TIMESTAMPTZ`（UTC）。
 - `paper-executor` は `FOR UPDATE SKIP LOCKED` で注文を取得します。同一建玉の全決済子注文は順序付け、約定記録と同じトランザクションで建玉・取消・Kill Switch を再確認して反転や取消後の約定を防ぎます。
+- API受付とExecutorは公開市場データを行ロックなしで取得し、その後に制御フラグ・建玉・親処理・注文を再確認します。全決済v1の大量子注文準備は制御フラグの行ロックを取らず、コミット直前に競合を検出します。v2は受付時の子注文数を建玉ごとに1件に抑えます。Kill Switchは制御フラグと取消要求を1トランザクションで確定します。UIはAPIのBybit metadata readinessが503でも起動・ログインでき、制御操作を提供します。
 - 外部市場データ（銘柄メタデータ）や仮想口座残高のためのテーブル新設は行わず、オンデマンド算出とインメモリキャッシュで対応します。
 
 ## 4. 取引所アダプター
@@ -77,7 +79,7 @@ PostgreSQL を注文ワークキューおよび状態管理として利用しま
 - **dYdX**: Mainnet Indexer の REST API を利用（ノード・署名不要）。
 - `settings.json` に定義された取引所だけを処理します。Bybit は市場metadataで USDT 建て・USDT 決済の linear swap と確認できれば、設定外銘柄も明示指定できます。他取引所は設定済み銘柄を対象とします。
 - Bybit の市場 ID（`BTCUSDT` 形式）をcanonicalとしてDBとAPI応答へ統一します。unified symbol（`BTC/USDT:USDT` 形式）はcase-sensitiveなaliasとして解決します。銘柄省略時の市場情報APIと`/exchanges`は設定済み銘柄を返します。
-- Bybit metadataのTTLは設定可能な300秒（既定値）です。有効期限内だけ再利用し、期限切れ後の更新失敗時に古い値へフォールバックしません。Mark Priceは照会ごとに取得し、古い価格を代用しません。並行したmetadata更新は共有poolとsingle-flight lockで集約します。
+- Bybit metadataのTTLは設定可能な300秒（既定値）です。有効期限内だけ再利用し、期限切れ後の更新失敗時に古い値へフォールバックしません。Binance・dYdXは取得後1時間以内のmetadataを新規・増加注文に使用し、更新失敗時は24時間以内のlast-known-goodをReduce-onlyだけに使用します。Mark Priceは照会ごとに取得し、古い価格を代用しません。並行したmetadata更新は共有poolとsingle-flight lockで集約します。
 - 価格の`mark_observed_at`はMark Priceを取得したUTC時刻です。板由来の`observed_at`は取引所の注文板timestampを優先し、存在しない場合は受信時刻を使います。Bybit の価格照会ではMark Priceが必須で、注文板が欠けた場合の板由来フィールドはnullを許容します。
 - readinessはDBと有効期限内のBybit metadata取得を集約します。取得済みmetadataで特定銘柄の制約だけが不正な場合はサービス全体を停止せず、その銘柄の注文で判定します。他取引所障害も該当APIへ隔離します。
 - 注文・約定履歴のsymbol検索はDBだけで完結します。照会時の設定にない取引所・symbolも検索でき、Bybit の一意に変換できるaliasは外部通信なしでcanonical化します。アダプター生成や外部metadata更新は行いません。
@@ -96,7 +98,7 @@ PostgreSQL を注文ワークキューおよび状態管理として利用しま
   - ワーカーが異常停止した場合に注文が `processing` のまま滞留するリスクがある（30秒以上更新のない注文を再取得対象とするタイムアウト機構を配備）。
 
 ### ステートレス＆オンデマンド設計の堅持
-銘柄メタデータ照会（`/instruments`）、リアルタイム価格照会（`/prices`）、口座残高照会（`/balance`）のための専用DBテーブル（`instruments`, `accounts`）や価格の常時収集は設けません。全決済の親処理と子注文の対応は永続化します。Bybit metadataは`trade-api`のlifespan taskが起動時にwarm-upし、設定可能な300秒のTTL内で更新します。更新に失敗して有効期限が切れた場合は該当リクエストとreadinessを503とし、期限切れデータを使用しません。
+銘柄メタデータ照会（`/instruments`）、リアルタイム価格照会（`/prices`）、口座残高照会（`/balance`）のための専用DBテーブル（`instruments`, `accounts`）や価格の常時収集は設けません。全決済の親処理と子注文の対応は永続化します。Bybit metadataは`trade-api`のlifespan taskが起動時にwarm-upし、設定可能な300秒のTTL内で更新します。更新に失敗して有効期限が切れた場合は該当リクエストとreadinessを503とし、期限切れデータを使用しません。Binance・dYdXの24時間以内のlast-known-goodはReduce-only用に限定します。
 
 - **採用理由**:
   - Trade Container の設計思想（ステートレスで軽量・堅牢なコンテナ基盤）を維持し、過剰設計を避けるため。

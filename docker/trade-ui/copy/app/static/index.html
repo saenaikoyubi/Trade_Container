@@ -18,6 +18,7 @@
         </div>
       </div>
       <div id="mode-badge" class="mode-badge normal"><span aria-hidden="true"></span>状態取得中</div>
+      <button id="logout" class="secondary-button" type="button">ログアウト</button>
     </header>
 
     <main>
@@ -79,6 +80,12 @@
           <button id="order-submit" class="primary-button" type="submit">注文内容を確認</button>
         </form>
         <p id="order-message" class="operation-message" role="status"></p>
+        <div id="pending-operation" class="operation-message" role="status" hidden>
+          <span id="pending-operation-status"></span>
+          <button id="pending-check" class="secondary-button" type="button">結果を照合</button>
+          <button id="pending-retry" class="warning-button" type="button">同じIDで再送</button>
+          <button id="pending-abandon" class="danger-button" type="button">別の操作を開始</button>
+        </div>
       </section>
 
       <section class="filter-panel" aria-labelledby="filter-title">

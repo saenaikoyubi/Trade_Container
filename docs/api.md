@@ -22,8 +22,11 @@
 | `GET` | `/api/v1/positions` | 保存済みポジション一覧 |
 | `GET` | `/api/v1/current-positions` | 現在価格・未実現損益付きポジション照会 |
 | `POST` | `/api/v1/positions/close` | 指定ポジションの全決済（Reduce-only 成行注文生成） |
+| `POST` | `/api/v2/positions/close` | 全決済の増分子注文生成（推奨） |
 | `GET` | `/api/v1/close-requests/{request_id}` | 全決済親処理と全子注文の状態照会 |
 | `POST` | `/api/v1/close-requests/{request_id}/cancel` | 全決済親処理の取消要求 |
+| `GET` | `/api/v2/close-requests/{request_id}` | v2全決済親処理の状態照会（v1と同じ表現） |
+| `POST` | `/api/v2/close-requests/{request_id}/cancel` | v2全決済親処理の取消要求（v1と同じ規則） |
 | `GET` | `/api/v1/pnl` | 実現損益合計 |
 | `GET` | `/api/v1/history/orders` | 注文履歴（`strategy_id` フィルタ・ページネーション対応） |
 | `GET` | `/api/v1/history/fills` | 約定履歴 |
@@ -37,6 +40,7 @@
 - Bybit では、取引所 metadata で USDT 建て・USDT 決済の Linear Perpetual と確認できれば、`settings.json` の `symbols` にない銘柄も明示指定できます。canonical symbol は `BTCUSDT` 形式の大文字市場 ID です。`BTC/USDT:USDT` 形式も入力でき、応答とDBには canonical symbol を使います。他取引所の設定済み銘柄の規則は維持します。比較はcase-sensitiveで、前後空白は `422 Unprocessable Entity` です。
 - 銘柄を省略した市場情報APIと`GET /api/v1/exchanges`は設定済み銘柄を返します。Bybit の全取引可能銘柄一覧ではありません。履歴APIはDBの監査記録を検索し、照会時の設定や外部市場データに依存しません。
 - 主なエラー区分は、認証失敗が`401`、対象なしが`404`、冪等性キーや取引制御との競合が`409`、注文・市場情報APIでの未知銘柄・対象外市場・取引不能・確定した制約違反が`422`、必要なmetadata・Mark Price・注文板・評価情報を取得できない場合が`503`です。DBローカルの履歴・保存済み建玉検索では未知銘柄は空結果とします。取得済みmetadataの検査に必要な制約が欠落・不正な場合も、利用者の入力違反ではなく`503`です。
+- Binance・dYdX の銘柄metadataは取得後1時間を新規・増加注文の鮮度上限とします。更新失敗後24時間以内のlast-known-goodはReduce-onlyに限り利用でき、24時間超または初回取得失敗は503です。Bybitは設定したTTL（既定300秒）を過ぎたmetadataを利用しません。注文板の観測時刻が現在より2秒超未来なら、鮮度不足として503またはExecutorの再試行にします。
 - すべての金額・数量は精度を失わない10進数のJSON文字列、日時はUTCのISO 8601文字列で返します。`null`許容フィールドも省略せず返します。各節のレスポンスモデル名は共通のフィールド集合を表し、同じモデルを使うAPIではフィールドの意味を変えません。
 - 以下に個別の例外がなければ、認証失敗は`401`、DBなど必須の内部依存が利用不能な場合は`503`です。Query・Path・Bodyの型・形式・範囲違反は`422`です。Bybit銘柄関連以外のエラーJSONはトップレベルの`detail`を持ちます。
 
@@ -52,7 +56,8 @@ Bybit の銘柄関連エラーはトップレベルの文字列`detail`（説明
 |---|---:|---|
 | 未知の銘柄 | 422 | `unknown_symbol` |
 | 対象外の市場 | 422 | `unsupported_market` |
-| 新規・増加注文ができない状態 | 422 | `instrument_not_tradable` |
+| `inactive`と確定し新規・増加注文ができない状態 | 422 | `instrument_not_tradable` |
+| 指値価格が取引所のtickに一致しない | 422 | `price_step_not_aligned` |
 | 必要な銘柄metadataの取得失敗 | 503 | `instrument_data_unavailable` |
 | 取得済みmetadataの検査に必要な制約の欠落・不正 | 503 | `instrument_metadata_invalid` |
 | Mark Priceの取得失敗 | 503 | `mark_price_unavailable` |
@@ -158,14 +163,9 @@ Bybit の銘柄関連エラーはトップレベルの文字列`detail`（説明
 - `strategy_id` (`Optional[str]`): 発注元の Bot / 戦略を識別する監査タグ。
 - `symbol`: Bybit ネイティブ表記（`BTCUSDT`）および CCXT 統一表記（`BTC/USDT:USDT`）の双方を受理し、Bybit の大文字市場 ID に正規化してDB保存・返却。対象の USDT Linear Perpetual なら設定への登録は不要です。
 - `order_type`: `limit`（`limit_price` 必須）または `market`。
-- **銘柄別数量バリデーション**: 受付時に以下の静的制約を同期検査し、違反時は `422 Unprocessable Entity` を返却（`paper-executor` でも執行直前に二重検査）。
-  - 最小数量: `quantity >= min_qty`
-  - 刻み幅: `(quantity - min_qty) % qty_step == 0`
-  - 最小 Notional: `quantity * price >= min_notional`（市場メタデータに正の`min_notional`が定義されている場合のみ適用。未定義なら検査しません。Limit注文: `limit_price`、API受付時のMarket注文: 新しい注文板の仲値`mid_price`。Bybitの`inactive`/`unknown`市場に対する既存建玉のReduce-only Marketだけは、新しいMark Priceを使用）
-  - Bybit Market注文は正の`max_market_qty`を必須とし、`quantity <= max_market_qty`を検査します。`max_qty`が定義されていればその上限も適用し、定義済みの値が不正なら503です。成行上限が欠落・不正な場合は503 `instrument_metadata_invalid`で、`max_qty`を代用しません。
-- **取引状態と情報不足**: Bybit の新規・増加注文は`active`の対象市場に限ります。`inactive`または`unknown`は`422`です。既存建玉のReduce-only縮小・決済は両状態で認めますが、注文種別はMarketのみです。状態が執行前に変わった既存のReduce-only Limit注文には取消要求を設定します。受付時に実際に検査する市場metadata、Mark Price、注文板を取得できなければ、注文を作成せず理由コード付きの`503`を返します。
-- **制約値の異常**: `min_qty`・`qty_step`の欠落/非正値、定義済み`min_notional`の非正値など、実際に検査する制約が不正なら`503 instrument_metadata_invalid`です。通常注文と部分決済の受付後に判明した場合、Executorは終端Rejectではなく再試行します。取得できた正常な制約に数量が違反するときだけ422です。
-- **Reduce-only 特例**: `reduce_only=true`かつ注文数量が現在建玉の全量に一致する単一注文は、端数残留を防ぐため`qty_step`・`min_notional`・`min_qty`の制約を、値の欠落・不正時も含めて免除します。Bybit Market注文の`max_market_qty`と定義済み`max_qty`、正の数量、反転禁止は免除しません。単一注文が成行上限を超える場合は422で拒否し、分割が必要なら`POST /api/v1/positions/close`を使用します。
+- **銘柄別数量・価格バリデーション**: 受付時に[取引・執行仕様](trading-engine.md)の市場、数量、指値tick、最小notionalを同期検査します。正常な制約に違反すれば422です。Bybitの必須metadataが欠落・不正、または取引状態が`unknown`なら503 `instrument_metadata_invalid`です。`inactive`と確定した新規・増加注文は422です。受付済み注文の一時的な情報不足はExecutorが再試行します。
+- **受付時の競合**: 市場情報を行ロックなしで取得した後、制御状態と対象建玉をロックして再確認します。建玉数量が検査中に変化した場合は409を返し、同じ`request_id`で再送できます。
+- **Reduce-only 特例**: 直接注文の全量決済では最小制約を免除します。免除範囲と執行時の扱いは[取引・執行仕様](trading-engine.md)を正本とします。Bybit Marketの数量上限を超える単一注文は422となるため、分割には`POST /api/v2/positions/close`を使用します。v1は既存クライアントとの互換用です。
 
 ---
 
@@ -277,9 +277,9 @@ Bybit の銘柄関連エラーはトップレベルの文字列`detail`（説明
 
 発注前の端数処理やポートフォリオ丸めに必要な銘柄仕様（刻み幅・最小数量など）を返却します。Bybit の USDT Linear Perpetual は設定外でも明示指定でき、CCXT の `load_markets()` から得られるメタデータを`exchanges.bybit.metadata_ttl_seconds`（既定300秒）のインメモリキャッシュで利用します。`symbol`を省略した場合は設定済み銘柄だけを返します。
 
-期限切れmetadataは返しません。Bybit が認識する対象市場なら`inactive`/`unknown`や`null`の制約値も`200 OK`で返します。`new_or_increase_allowed`は状態が`active`で、すべての注文種別に共通する必須制約が正常な場合だけ`true`です。`false`の理由は`new_or_increase_reason_code`で返します。これは市場metadataから分かる基本的な適格性であり、Market固有の`max_market_qty`、注文板・Mark Priceの取得、個別リスク検査の成功まで保証しません。未知銘柄・対象外市場は422、metadata取得失敗は503です。
+Bybitの期限切れmetadataは返しません。Binance・dYdXは更新失敗時に24時間以内のlast-known-goodを返すことがあり、`metadata_stale`で区別します。Bybit が認識する対象市場なら`inactive`/`unknown`や`null`の制約値も`200 OK`で返します。`new_or_increase_allowed`はMarketとLimitの両方のmetadata事前判定が可能な場合だけ`true`で、理由は`new_or_increase_reason_code`に返します。この判定は注文板・Mark Priceの取得、個別リスク検査の成功を保証しません。未知銘柄・対象外市場は422、metadata取得失敗は503です。
 
-`inactive`/`unknown`なら`new_or_increase_reason_code=instrument_not_tradable`、取引状態が`active`で検査に必要な`min_qty`・`qty_step`または定義済み`min_notional`・`max_qty`が不正なら`instrument_metadata_invalid`です。状態と制約の両方に問題がある場合は状態の理由を優先します。いずれも新規・増加の基本的な適格性だけを示し、保有建玉のReduce-only全決済可否は別途判定します。
+`inactive`なら`new_or_increase_reason_code=instrument_not_tradable`、`unknown`または取引状態が`active`で検査に必要な`min_qty`・`qty_step`・Bybitの`price_step`・定義済み`min_notional`・`max_qty`が不正なら`instrument_metadata_invalid`です。いずれも新規・増加の基本的な適格性だけを示し、保有建玉のReduce-only全決済可否は別途判定します。
 
 - **Path**: `GET /api/v1/instruments`
 - **Query Parameters**:
@@ -304,12 +304,21 @@ Bybit の銘柄関連エラーはトップレベルの文字列`detail`（説明
     "max_market_qty": "50.0",
     "price_step": "0.10",
     "min_notional": "5.0",
+    "quantity_unit": "BTC",
     "status": "active",
+    "metadata_age_seconds": 0.5,
+    "metadata_stale": false,
     "new_or_increase_allowed": true,
-    "new_or_increase_reason_code": null
+    "new_or_increase_reason_code": null,
+    "market_new_or_increase_allowed": true,
+    "market_new_or_increase_reason_code": null,
+    "limit_new_or_increase_allowed": true,
+    "limit_new_or_increase_reason_code": null
   }
 ]
 ```
+
+`market_new_or_increase_*`と`limit_new_or_increase_*`はmetadataだけを使う注文種別別の事前判定です。既存の`new_or_increase_allowed`は両種別が可能な場合だけ`true`になる保守的な集約値です。価格、数量、残高、取引制御は注文受付時に別途判定します。`metadata_age_seconds`はキャッシュ取得からの秒数、`metadata_stale`はBinance・dYdXの1時間超のlast-known-good利用を表します。dYdXの`tickSize`欠落ではMarketの事前判定は可能でもLimit受付は503です。`minOrderSize`欠落は新規・増加注文を不可にし、`minNotional`が未提供なら最小金額を推測せず、その検査を省略します。
 
 ---
 
@@ -349,6 +358,7 @@ Bybit の価格照会が成功するには正の`mark_price`と`mark_observed_at
 設定ファイル（`initial_balance`）および既存の確定損益（手数料控除済純損益）・未実現損益から決定論的にオンデマンド算出した純資産（Equity）および余力を返却します（`total_fee` は監査・表示用内訳）。
 
 Paper環境ではUSD・USDC・USDTを1:1として集計します。Bybit の設定外建玉もその銘柄metadataとMark Priceから評価します。その他の決済通貨を持つopen position、または1件でも必要なmetadata・価格を取得できないpositionがある場合は503です。
+建玉、確定損益、手数料は1回のDB読取で同一コミット済み時点の値を使います。市場価格はその後に照会します。
 
 使用証拠金は全銘柄に設定ファイルの`account.default_leverage`を一律適用し、銘柄別レバレッジは持ちません。計算式とBybitのMark Priceによる評価単価は[取引・執行仕様](trading-engine.md)に従います。
 
@@ -549,7 +559,7 @@ DBに保存された建玉行を返します。数量ゼロになった行も、
 
 ---
 
-### 12. ポジション全決済 (`POST /api/v1/positions/close`)
+### 12. ポジション全決済 (`POST /api/v1/positions/close` / `POST /api/v2/positions/close`)
 
 指定取引所の保有建玉のスナップショットに対する、非同期の全決済親処理を登録します。`202 Accepted`は決済注文群の登録を意味し、建玉ゼロの保証ではありません。子注文と残数量は親処理のGETで監視します。
 
@@ -566,15 +576,15 @@ DBに保存された建玉行を返します。数量ゼロになった行も、
 - `symbol`省略時は受付時点で指定取引所に存在する全建玉を対象とし、後からできた建玉は含めません。対象建玉をロックし、全対象の市場・価格・上限を事前検査します。1銘柄でも受付に必要な情報が欠ければ、親処理も子注文も作らず503を返します。対象外市場と確定した場合は422で、同様に何も作成しません。
 - 対象建玉の既存未完了注文には取消要求を設定し、反対売買のReduce-only Market子注文を作ります。親処理、対象建玉、取消要求、初期子注文、冪等性キーは1トランザクションで記録します。同じ建玉で別の全決済が進行中なら409です。進行中の対象銘柄への別の`POST /orders`も、Reduce-onlyを含め409です。
 - Bybit Market子注文には正の`max_market_qty`が必須です。`max_qty`があれば両者の小さい方を子注文の上限とし、Decimalで数量合計が受付時の建玉全量に一致するよう分割します。`max_market_qty`が欠落・不正、または定義済み`max_qty`が不正なら`503 instrument_metadata_invalid`で、`max_qty`による成行上限の代用はしません。
-- 親に属する**すべて**の子注文は`min_qty`、`qty_step`、`min_notional`を値の欠落・不正時も含めて免除します。内部の`max_order_quantity`、`max_order_notional`、注文頻度、`max_position_notional`、日次損失上限も免除します。市場の`max_market_qty`と定義済み`max_qty`、正の数量、対象市場判定、Reduce-onlyの反転禁止、必要データの鮮度は免除しません。
-- 初期子注文を受付時に全件作成し、同じ建玉では子順序で逐次執行します。部分約定で残りが取り消された場合は実際の建玉を再計算し、同じ親に追加子注文を作ります。受付済み子注文の数量は変更しません。流動性や一時的な市場情報が不足した場合、固定回数で終了せず、指数バックオフで待機します。
+- 親に属する子注文のリスク制約免除は[取引・執行仕様](trading-engine.md)に従います。親と子の状態・監査記録は[DB運用手順](database.md)に従います。
+- v1は互換性のため、受付時の建玉全量を上限内に分割した初期子注文をすべて同一トランザクションで作成してから`202`を返します。v2は受付時に親と建玉スナップショットを永続化し、建玉ごとに最初の子注文だけを作成します。子が終端になった後、同じ親の残建玉に対し次の子を1件ずつ生成します。どちらも同じ建玉では子順序で逐次執行し、部分約定で残りが取り消された場合は実際の建玉を再計算して追加子を作ります。受付済み子の数量は変更しません。流動性や一時的な市場情報が不足した場合、固定回数で終了せず、指数バックオフで待機します。
 - Bybitの`inactive`/`unknown`対象市場で既存建玉を閉じるときは、新しいMark Priceを取得できれば板がなくてもPaper成行決済します。受付時に必要なMark Priceを取得できなければ503です。受付後の取得失敗は親を`waiting`として再試行します。対象外市場と確定した銘柄はその建玉の処理を`failed`にしますが、他銘柄の執行は続けます。
 - 受付後に取引所が設定から削除された場合、未完了の通常注文は拒否し、進行中の全決済では該当建玉の処理を`failed`にします。他銘柄の処理は続けます。
 - trade-ui経由の直接注文と全決済では、ブラウザpayloadの値にかかわらずproxyが`strategy_id: "manual"`を強制付与します。
 
-**HTTP応答**: 新規の非空処理は`202 Accepted`。初回に対象建玉がなければ子注文0件の`completed`親処理を記録して`200 OK`。同一`request_id`・同一入力の再送は市場情報を再取得せず、その時点の親処理を`200 OK`で返します。キーを他の通常注文や異なる全決済入力に使った場合は409です。
+**HTTP応答**: 新規の非空処理は`202 Accepted`。初回に対象建玉がなければ子注文0件の`completed`親処理を記録して`200 OK`。同一`request_id`・同一入力・同一APIバージョンの再送は市場情報を再取得せず、その時点の親処理を`200 OK`で返します。キーを他の通常注文、異なる全決済入力、異なるAPIバージョンに使った場合は409です。Kill Switchが有効な場合、およびv1の大量子注文準備中に制御更新と競合した場合も409となり、同じキーで安全に再試行できます。
 
-**レスポンスモデル `CloseRequestView`**: `request_id`、`exchange_id`、`symbol`（省略時は`null`）、`strategy_id`、`status`、`positions: list[ClosePositionView]`、`items: list[OrderView]`、`reason_code`、`detail`、`created_at`、`updated_at`。`ClosePositionView`は`symbol`、受付時と現在の符号付き建玉数量（`initial_position_quantity`、`remaining_position_quantity`）、`status`、`reason_code`、`detail`を持ちます。`items`は初期子注文と後から追加した子注文を含み、銘柄・子順序で安定して並びます。子の`request_id`は親の内部ID・建玉ID・連番から一意に生成する不透明な値で、利用者は解析しません。
+**レスポンスモデル `CloseRequestView`**: `request_id`、`exchange_id`、`symbol`（省略時は`null`）、`strategy_id`、`status`、`generation_mode`（v1=`eager`、v2=`incremental`）、`positions: list[ClosePositionView]`、`items: list[OrderView]`、`reason_code`、`detail`、`created_at`、`updated_at`。`ClosePositionView`は`symbol`、受付時と現在の符号付き建玉数量（`initial_position_quantity`、`remaining_position_quantity`）、`status`、`reason_code`、`detail`を持ちます。`items`はその時点で生成済みの子注文を銘柄・子順序で安定して並べます。v2では将来の子は後から追加されます。子の`request_id`は親の内部ID・建玉ID・連番から一意に生成する不透明な値で、利用者は解析しません。
 
 親の`status`は`queued`、`running`、`waiting`、`canceling`、`completed`、`canceled`、`failed`です。`completed`は対象建玉がすべてゼロで、残る子注文も終端のときだけです。1銘柄が確定失敗しても他銘柄の処理中は親を`running`または`waiting`とし、個別の失敗を`positions`に表示します。すべての処理が終わったときに失敗が残れば親を`failed`にします。
 
@@ -587,6 +597,7 @@ DBに保存された建玉行を返します。数量ゼロになった行も、
   "symbol": "BTCUSDT",
   "strategy_id": "alpha-v1",
   "status": "queued",
+  "generation_mode": "eager",
   "positions": [{
     "symbol": "BTCUSDT",
     "initial_position_quantity": "20",
@@ -629,8 +640,8 @@ DBに保存された建玉行を返します。数量ゼロになった行も、
 
 ### 13. 全決済親処理の照会・取消
 
-- `GET /api/v1/close-requests/{request_id}`: 既存の親処理を`200 OK`の`CloseRequestView`で返し、未存在は404です。ポーリングではこのGETを使います。通常注文の`GET /api/v1/orders/by-request-id/{request_id}`は子注文を含む単一注文専用です。
-- `POST /api/v1/close-requests/{request_id}/cancel`: 親を`canceling`にして未完了子注文へ取消要求を出し、`202 Accepted`の`CloseRequestView`を返します。全子注文の終端後に親を`canceled`にします。`canceled`への再送は`200 OK`で同じ親を返し、`completed`/`failed`には409、未存在は404です。
+- `GET /api/v1/close-requests/{request_id}` / `GET /api/v2/close-requests/{request_id}`: 既存の親処理を`200 OK`の`CloseRequestView`で返し、未存在は404です。ポーリングではこのGETを使います。通常注文の`GET /api/v1/orders/by-request-id/{request_id}`は子注文を含む単一注文専用です。
+- `POST /api/v1/close-requests/{request_id}/cancel` / `POST /api/v2/close-requests/{request_id}/cancel`: 親を`canceling`にして未完了子注文へ取消要求を出し、`202 Accepted`の`CloseRequestView`を返します。全子注文の終端後に親を`canceled`にします。未完了子注文がなければ同じトランザクションで`canceled`になります。`canceled`への再送は`200 OK`で同じ親を返し、`completed`/`failed`には409、未存在は404です。
 - `POST /api/v1/orders/{order_id}/cancel`で親に属する子注文を個別に取り消した場合も、親全体を`canceling`にして代替子注文の自動生成を止めます。取消受付後の約定記録を防ぐため、約定保存時に取消とKill Switchを再確認します。
 
 ---
@@ -671,7 +682,7 @@ DBに保存された建玉行を返します。数量ゼロになった行も、
 ```
 
 - **Close-only**: 有効化時にKill Switchを解除し、未完了の非 Reduce-only 注文へ取消要求を発行して新規・増加注文を拒否します。有効なReduce-only決済は続けます。
-- **Kill Switch**: 有効化時にClose-onlyを解除し、新規注文・全決済の受付を409で拒否します。未完了注文は取消へ進め、進行中の全決済親処理は`canceling`へ移します。約定保存時にフラグを再確認し、有効化の受付後に新たな約定を記録しません。既存注文を保留して解除後に再開することはありません。
+- **Kill Switch**: 有効化時にClose-onlyを解除し、新規注文・全決済の受付を409で拒否します。制御フラグ、未完了注文の取消要求、進行中の全決済親処理の`canceling`への移行を同一DBトランザクションで確定します。未完了子のない親・対象建玉はその場で`canceled`にします。成功の基準時点はこのコミットで、10,000子注文の準備中でも5秒以内を目標とします。約定保存時にフラグを再確認し、コミット後に新たな約定を記録しません。既存注文を保留して解除後に再開することはありません。
 - **解除**: 対象フラグを`false`にして他方の有効なフラグは変更しません。両方無効になれば`reason=null`です。解除済み注文と全決済親処理は自動再開しません。注文照会・取消APIはKill Switch有効時も使えます。
 
 **`POST /api/v1/kill-switch`のレスポンス例**:

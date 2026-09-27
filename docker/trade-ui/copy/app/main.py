@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+import secrets
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -10,14 +17,19 @@ from urllib.parse import quote, urlsplit
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 API_BASE_URL = os.getenv("TRADE_API_BASE_URL", "http://trade-api:8000").rstrip("/")
 API_TOKEN_FILE = os.getenv("API_TOKEN_FILE", "/run/api-secrets/api_token")
+UI_PASSWORD_FILE = os.getenv("UI_PASSWORD_FILE", "/run/ui-secrets/ui_password")
+UI_SESSION_SECRET_FILE = os.getenv("UI_SESSION_SECRET_FILE", "/run/ui-secrets/ui_session_secret")
+SESSION_COOKIE = "trade_ui_session"
+SESSION_SECONDS = 3600
 
 app = FastAPI(
     title="Trade History UI",
@@ -71,6 +83,63 @@ class UiControlUpdate(BaseModel):
 
     enabled: bool
     reason: str | None = Field(default=None, max_length=500)
+
+
+class UiLogin(BaseModel):
+    password: str = Field(min_length=1, max_length=256)
+
+
+def _secret_file(path: str) -> str:
+    value = Path(path).read_text(encoding="utf-8").strip()
+    if not value:
+        raise RuntimeError("UI authentication secret is unavailable")
+    return value
+
+
+def _ui_password() -> str:
+    return _secret_file(UI_PASSWORD_FILE)
+
+
+def _session_secret() -> bytes:
+    return _secret_file(UI_SESSION_SECRET_FILE).encode("utf-8")
+
+
+def _session_token() -> tuple[str, str]:
+    csrf = secrets.token_urlsafe(32)
+    payload = json.dumps({"exp": int(time.time()) + SESSION_SECONDS, "csrf": csrf}, separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    signature = hmac.new(_session_secret(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}", csrf
+
+
+def _session_payload(request: Request) -> dict | None:
+    token = request.cookies.get(SESSION_COOKIE, "")
+    try:
+        encoded, signature = token.split(".", 1)
+        expected = hmac.new(_session_secret(), encoded.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        if not isinstance(payload, dict) or int(payload["exp"]) <= int(time.time()):
+            return None
+        if not isinstance(payload.get("csrf"), str) or not payload["csrf"]:
+            return None
+        return payload
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, UnicodeDecodeError, binascii.Error):
+        return None
+
+
+@app.middleware("http")
+async def require_ui_session(request: Request, call_next):
+    if request.url.path.startswith("/ui-api/"):
+        session = _session_payload(request)
+        if session is None:
+            return JSONResponse({"detail": "UI login is required"}, status_code=401, headers={"Cache-Control": "no-store"})
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not hmac.compare_digest(
+            request.headers.get("x-csrf-token", ""), session["csrf"]
+        ):
+            return JSONResponse({"detail": "invalid CSRF token"}, status_code=403, headers={"Cache-Control": "no-store"})
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -174,9 +243,52 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/auth/login", include_in_schema=False)
+def login(payload: UiLogin, request: Request):
+    _require_same_origin(request)
+    try:
+        expected = _ui_password()
+        if not hmac.compare_digest(payload.password, expected):
+            raise HTTPException(status_code=401, detail="invalid UI password")
+        token, csrf = _session_token()
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail="UI authentication is unavailable") from exc
+    response = JSONResponse({"csrf_token": csrf}, headers={"Cache-Control": "no-store"})
+    response.set_cookie(
+        SESSION_COOKIE, token, max_age=SESSION_SECONDS, httponly=True,
+        secure=request.url.scheme == "https", samesite="strict", path="/",
+    )
+    return response
+
+
+@app.get("/auth/session", include_in_schema=False)
+def session_status(request: Request):
+    session = _session_payload(request)
+    if session is None:
+        raise HTTPException(status_code=401, detail="UI login is required")
+    return JSONResponse(
+        {"csrf_token": session["csrf"], "expires_at": session["exp"]},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/auth/logout", include_in_schema=False)
+def logout(request: Request):
+    _require_same_origin(request)
+    session = _session_payload(request)
+    if session is None:
+        raise HTTPException(status_code=401, detail="UI login is required")
+    if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), session["csrf"]):
+        raise HTTPException(status_code=403, detail="invalid CSRF token")
+    response = JSONResponse({"status": "logged_out"}, headers={"Cache-Control": "no-store"})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
 @app.get("/", include_in_schema=False)
-def index():
-    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
+def index(request: Request):
+    page = "index.html" if _session_payload(request) is not None else "login.html"
+    return FileResponse(STATIC_DIR / page, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/ui-api/history/orders", include_in_schema=False)
@@ -228,7 +340,7 @@ async def close_positions(payload: UiPositionClose, request: Request):
     upstream_payload = payload.model_dump(mode="json", exclude_none=True)
     upstream_payload["strategy_id"] = "manual"
     return await _proxy_post(
-        "/api/v1/positions/close",
+        "/api/v2/positions/close",
         upstream_payload,
     )
 
@@ -253,13 +365,20 @@ async def set_kill_switch(payload: UiControlUpdate, request: Request):
 
 @app.get("/ui-api/close-requests/{request_id}", include_in_schema=False)
 async def get_close_request(request_id: str):
-    return await _proxy_get(f"/api/v1/close-requests/{quote(request_id, safe='')}")
+    return await _proxy_get(f"/api/v2/close-requests/{quote(request_id, safe='')}")
+
+
+@app.get("/ui-api/orders/by-request-id/{request_id}", include_in_schema=False)
+async def get_order_by_request_id(request_id: str):
+    if not REQUEST_ID_PATTERN.fullmatch(request_id):
+        raise HTTPException(status_code=422, detail="invalid request id")
+    return await _proxy_get(f"/api/v1/orders/by-request-id/{quote(request_id, safe='')}")
 
 
 @app.post("/ui-api/close-requests/{request_id}/cancel", include_in_schema=False)
 async def cancel_close_request(request_id: str, request: Request):
     _require_same_origin(request)
-    return await _proxy_post(f"/api/v1/close-requests/{quote(request_id, safe='')}/cancel")
+    return await _proxy_post(f"/api/v2/close-requests/{quote(request_id, safe='')}/cancel")
 
 
 @app.get("/ui-api/orders/{order_id}/fills", include_in_schema=False)

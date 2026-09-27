@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Iterable
 
 
@@ -9,6 +9,7 @@ from typing import Iterable
 class SimulatedExecution:
     quantity: Decimal
     average_price: Decimal
+    notional: Decimal
     fee: Decimal
     fully_filled: bool
 
@@ -39,11 +40,16 @@ def simulate_order(
     notional = Decimal("0")
     filled = Decimal("0")
 
-    for raw_price, raw_quantity, *_ in levels:
-        price = Decimal(str(raw_price))
-        available = Decimal(str(raw_quantity))
-        if available <= 0:
-            continue
+    for level in levels:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            raise ValueError("order book has an invalid level")
+        try:
+            price = Decimal(str(level[0]))
+            available = Decimal(str(level[1]))
+        except (IndexError, InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("order book has an invalid level") from exc
+        if not price.is_finite() or not available.is_finite() or price <= 0 or available <= 0:
+            raise ValueError("order book has an invalid level")
         if order_type == "limit" and limit_price is not None:
             if side == "buy" and price > limit_price:
                 break
@@ -62,6 +68,7 @@ def simulate_order(
     return SimulatedExecution(
         quantity=filled,
         average_price=average,
+        notional=notional,
         fee=notional * fee_rate,
         fully_filled=remaining <= 0,
     )

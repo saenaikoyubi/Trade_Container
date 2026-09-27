@@ -50,6 +50,7 @@ class CcxtAdapter:
         self._canonical_to_exchange: dict[str, str] = {}
         self._instrument_cache: dict[str, dict[str, Any]] = {}
         self._unsupported_aliases: set[str] = set()
+        self._inconclusive_aliases: set[str] = set()
         self._markets_loaded = False
         self._metadata_loaded_at: float | None = None
         self._metadata_last_error: str | None = None
@@ -130,6 +131,19 @@ class CcxtAdapter:
         qty_step_raw = precision.get("amount")
         if qty_step_raw is None:
             qty_step_raw = lot_size.get("qtyStep")
+        price_filter = info.get("priceFilter") if isinstance(info.get("priceFilter"), dict) else {}
+        price_step_raw = price_filter.get("tickSize")
+        if price_step_raw is None:
+            price_step_raw = precision.get("price")
+        # Bybit's tickSize is already a step, while CCXT precision may encode
+        # decimal places depending on precisionMode.
+        price_step = (
+            _decimal(price_step_raw, positive=True)
+            if price_filter.get("tickSize") is not None
+            else self._precision_step(price_step_raw)
+        )
+        if price_step_raw is not None and price_step is None:
+            invalid_fields.append("price_step")
 
         return {
             "exchange_id": self.exchange_id,
@@ -143,7 +157,7 @@ class CcxtAdapter:
             "min_qty": parsed(min_qty_raw, "min_qty"),
             "max_qty": parsed(max_qty_raw, "max_qty"),
             "max_market_qty": max_market_qty,
-            "price_step": self._precision_step(precision.get("price")),
+            "price_step": price_step,
             "min_notional": min_notional,
             "quantity_unit": market.get("base"),
             "status": status,
@@ -158,11 +172,25 @@ class CcxtAdapter:
             exchange_symbols: dict[str, str] = {}
             instruments: dict[str, dict[str, Any]] = {}
             known: set[str] = set()
+            inconclusive: set[str] = set()
             for market in markets.values():
                 if not isinstance(market, dict):
                     continue
                 market_aliases = {str(market.get("id") or ""), str(market.get("symbol") or "")}
                 known.update(alias for alias in market_aliases if alias)
+                explicit_unsupported = (
+                    market.get("spot") is True
+                    or market.get("future") is True
+                    or market.get("inverse") is True
+                    or market.get("swap") is False
+                    or market.get("linear") is False
+                    or market.get("quote") not in {None, "USDT"}
+                    or market.get("settle") not in {None, "USDT"}
+                )
+                if not explicit_unsupported and any(
+                    market.get(field) is None for field in ("swap", "linear", "quote", "settle")
+                ):
+                    inconclusive.update(alias for alias in market_aliases if alias)
                 if not (
                     market.get("swap") is True
                     and market.get("linear") is True
@@ -188,7 +216,8 @@ class CcxtAdapter:
                 self._alias_to_canonical = aliases
                 self._canonical_to_exchange = exchange_symbols
                 self._instrument_cache = instruments
-                self._unsupported_aliases = known - set(aliases)
+                self._unsupported_aliases = known - set(aliases) - inconclusive
+                self._inconclusive_aliases = inconclusive - set(aliases)
                 self._metadata_loaded_at = time.monotonic()
                 self._metadata_last_error = None
                 self._markets_loaded = True
@@ -284,6 +313,8 @@ class CcxtAdapter:
         canonical = self._alias_to_canonical.get(raw_symbol)
         if canonical is None:
             if self.exchange_id == "bybit":
+                if raw_symbol in self._inconclusive_aliases:
+                    raise MarketRuleError("instrument_metadata_invalid", f"Bybit market metadata is incomplete: {raw_symbol}", 503)
                 if raw_symbol in self._unsupported_aliases:
                     raise MarketRuleError("unsupported_market", f"unsupported Bybit market: {raw_symbol}", 422)
                 raise MarketRuleError("unknown_symbol", f"unknown Bybit symbol: {raw_symbol}", 422)
@@ -305,10 +336,18 @@ class CcxtAdapter:
 
     def fetch_instruments(self, symbol: str | None = None) -> list[dict[str, Any]]:
         self._refresh_metadata()
+        age = self.metadata_age_seconds
+        stale = self.exchange_id != "bybit" and age is not None and age > METADATA_TTL_SECONDS
+        def view(canonical: str) -> dict[str, Any]:
+            return {
+                **self._instrument_cache[canonical],
+                "metadata_age_seconds": age,
+                "metadata_stale": stale,
+            }
         if symbol is not None:
             canonical = self.resolve_symbol(symbol)
-            return [dict(self._instrument_cache[canonical])]
-        return [dict(self._instrument_cache[self.resolve_symbol(item)]) for item in self.config.symbols]
+            return [view(canonical)]
+        return [view(self.resolve_symbol(item)) for item in self.config.symbols]
 
     @staticmethod
     def _ticker_value(ticker: dict[str, Any], key: str, *info_keys: str) -> Decimal | None:

@@ -8,6 +8,7 @@ import hmac
 import logging
 import os
 import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -17,11 +18,11 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, st
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import and_, func, or_, select, text, update
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from trade_common.config import read_secret, settings
-from trade_common.close_service import active_parent_for_position, all_children, append_child, cancel_parent, refresh_parent
+from trade_common.close_service import active_parent_for_position, all_children, append_initial_children, cancel_parent, refresh_parent
 from trade_common.database import engine, session_factory
 from trade_common.exchange_adapters import ExchangeAdapterPool
 from trade_common.logging_config import configure_logging
@@ -30,7 +31,7 @@ from trade_common.market_rules import (
     bybit_history_symbols, bybit_local_canonical, fresh_mark_price, positive_decimal,
 )
 from trade_common.models import CloseRequest, CloseRequestPosition, ControlFlag, DailyPnl, Fill, Order, Position, RequestKey
-from trade_common.risk import validate_instrument_market, validate_instrument_quantity
+from trade_common.risk import instrument_preflight_reason, validate_instrument_market, validate_instrument_quantity, validate_limit_price
 from trade_common.valuation import (
     ValuationError,
     calculate_account_balance,
@@ -258,8 +259,14 @@ class InstrumentView(BaseModel):
     min_notional: Decimal | None
     quantity_unit: str | None = None
     status: str
+    metadata_age_seconds: float | None = None
+    metadata_stale: bool = False
     new_or_increase_allowed: bool
     new_or_increase_reason_code: str | None
+    market_new_or_increase_allowed: bool
+    market_new_or_increase_reason_code: str | None
+    limit_new_or_increase_allowed: bool
+    limit_new_or_increase_reason_code: str | None
 
 
 class PriceView(BaseModel):
@@ -370,6 +377,7 @@ class CloseRequestView(BaseModel):
     symbol: str | None
     strategy_id: str | None
     status: str
+    generation_mode: Literal["eager", "incremental"]
     positions: list[ClosePositionView]
     items: list[OrderView]
     reason_code: str | None
@@ -500,7 +508,7 @@ def _close_view(db: Session, parent: CloseRequest) -> CloseRequestView:
     return CloseRequestView(
         request_id=parent.request_id, exchange_id=parent.exchange_id,
         symbol=parent.symbol, strategy_id=parent.strategy_id,
-        status=parent.status,
+        status=parent.status, generation_mode=parent.generation_mode,
         positions=[ClosePositionView.model_validate({
             "symbol": item.symbol,
             "initial_position_quantity": item.initial_position_quantity,
@@ -598,21 +606,15 @@ def list_instruments(
 
 def _instrument_view(item: dict) -> dict:
     result = dict(item)
-    invalid = set(item.get("_invalid_fields") or ())
-    if item.get("status") != "active":
-        reason = "instrument_not_tradable"
-    elif (
-        positive_decimal(item.get("min_qty")) is None
-        or positive_decimal(item.get("qty_step")) is None
-        or any(name in invalid for name in ("min_qty", "qty_step", "min_notional", "max_qty"))
-        or (item.get("min_notional") is not None and positive_decimal(item.get("min_notional")) is None)
-        or (item.get("max_qty") is not None and positive_decimal(item.get("max_qty")) is None)
-    ):
-        reason = "instrument_metadata_invalid"
-    else:
-        reason = None
-    result["new_or_increase_allowed"] = reason is None
-    result["new_or_increase_reason_code"] = reason
+    market_reason = instrument_preflight_reason(item, "market")
+    limit_reason = instrument_preflight_reason(item, "limit")
+    result["metadata_stale"] = bool(item.get("metadata_stale"))
+    result["market_new_or_increase_allowed"] = market_reason is None
+    result["market_new_or_increase_reason_code"] = market_reason
+    result["limit_new_or_increase_allowed"] = limit_reason is None
+    result["limit_new_or_increase_reason_code"] = limit_reason
+    result["new_or_increase_allowed"] = market_reason is None and limit_reason is None
+    result["new_or_increase_reason_code"] = market_reason or limit_reason
     return result
 
 
@@ -746,8 +748,14 @@ def _validate_order_instrument(
     )
     if not market_decision.allowed:
         if exchange.exchange_id == "bybit" and market_decision.reason_code:
-            raise MarketRuleError(market_decision.reason_code, market_decision.reason or "instrument is not tradable", 422)
-        raise HTTPException(status_code=422, detail=market_decision.reason)
+            raise MarketRuleError(market_decision.reason_code, market_decision.reason or "instrument is not tradable", 503 if market_decision.temporary else 422)
+        raise HTTPException(status_code=503 if market_decision.temporary else 422, detail=market_decision.reason)
+    if payload.order_type == "limit":
+        price_decision = validate_limit_price(payload.limit_price, instrument, exchange_id=payload.exchange_id)
+        if not price_decision.allowed:
+            if exchange.exchange_id == "bybit" and price_decision.reason_code:
+                raise MarketRuleError(price_decision.reason_code, price_decision.reason or "limit price is invalid", 503 if price_decision.temporary else 422)
+            raise HTTPException(status_code=503 if price_decision.temporary else 422, detail=price_decision.reason)
     is_full_close = _full_close(db, payload, canonical_symbol)
     price = payload.limit_price
     if payload.order_type == "market" and exchange.exchange_id == "bybit" and instrument.get("status") != "active":
@@ -809,6 +817,12 @@ def create_order(payload: OrderCreate, response: Response, db: Db, _: Auth):
     config = _runtime_settings()
     exchange_config = _exchange_config(config, payload.exchange_id)
     canonical_symbol = _canonical_symbol(config, exchange_config, payload.symbol)
+    preflight_position = db.scalar(select(Position).where(
+        Position.exchange_id == payload.exchange_id, Position.symbol == canonical_symbol
+    ))
+    preflight_quantity = Decimal(preflight_position.quantity) if preflight_position is not None else Decimal("0")
+    _validate_order_instrument(db, config, exchange_config, payload, canonical_symbol)
+    db.rollback()
     control = db.get(ControlFlag, 1, with_for_update=True)
     if control and control.kill_switch:
         raise HTTPException(status_code=409, detail="kill switch is enabled")
@@ -820,9 +834,11 @@ def create_order(payload: OrderCreate, response: Response, db: Db, _: Auth):
     position = db.scalar(select(Position).where(
         Position.exchange_id == payload.exchange_id, Position.symbol == canonical_symbol
     ).with_for_update())
+    current_quantity = Decimal(position.quantity) if position is not None else Decimal("0")
+    if current_quantity != preflight_quantity:
+        raise HTTPException(status_code=409, detail="position changed during order validation; retry with the same request_id")
     if position is not None and active_parent_for_position(db, position.id) is not None:
         raise HTTPException(status_code=409, detail="a close request is already active for this position")
-    _validate_order_instrument(db, config, exchange_config, payload, canonical_symbol)
 
     item = Order(
         request_id=payload.request_id,
@@ -1127,10 +1143,23 @@ def _close_market_cap(exchange_id: str, symbol: str, quantity: Decimal, instrume
     status_code=status.HTTP_202_ACCEPTED,
 )
 def close_positions(payload: PositionCloseRequest, response: Response, db: Db, _: Auth):
+    return _create_close_positions(payload, response, db, generation_mode="eager")
+
+
+@app.post(
+    "/api/v2/positions/close",
+    response_model=CloseRequestView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def close_positions_v2(payload: PositionCloseRequest, response: Response, db: Db, _: Auth):
+    return _create_close_positions(payload, response, db, generation_mode="incremental")
+
+
+def _create_close_positions(payload: PositionCloseRequest, response: Response, db: Session, *, generation_mode: str):
     key = db.get(RequestKey, payload.request_id)
     existing_parent = db.scalar(select(CloseRequest).where(CloseRequest.request_id == payload.request_id))
     if existing_parent is not None:
-        if not _same_close_input(existing_parent, payload):
+        if existing_parent.generation_mode != generation_mode or not _same_close_input(existing_parent, payload):
             raise HTTPException(status_code=409, detail="request_id is already used by a different close request")
         response.status_code = 200
         return _close_view(db, existing_parent)
@@ -1138,9 +1167,6 @@ def close_positions(payload: PositionCloseRequest, response: Response, db: Db, _
         raise HTTPException(status_code=409, detail="request_id is already used by an order")
     config = _runtime_settings()
     exchange_config = _exchange_config(config, payload.exchange_id)
-    control = db.get(ControlFlag, 1, with_for_update=True)
-    if control is not None and control.kill_switch:
-        raise HTTPException(status_code=409, detail="kill switch is enabled")
     canonical_symbol = (
         _canonical_symbol(config, exchange_config, payload.symbol)
         if payload.symbol is not None
@@ -1154,14 +1180,11 @@ def close_positions(payload: PositionCloseRequest, response: Response, db: Db, _
             Position.quantity != 0,
         )
         .order_by(Position.symbol)
-        .with_for_update()
     )
     if canonical_symbol:
         query = query.where(Position.symbol == canonical_symbol)
     positions = list(db.scalars(query).all())
-    for position in positions:
-        if active_parent_for_position(db, position.id) is not None:
-            raise HTTPException(status_code=409, detail="a close request is already active for this position")
+    position_snapshot = [(item.id, Decimal(item.quantity), item.symbol) for item in positions]
 
     caps: dict[str, Decimal] = {}
     if positions:
@@ -1184,8 +1207,8 @@ def close_positions(payload: PositionCloseRequest, response: Response, db: Db, _
             )
             if not market_decision.allowed:
                 if payload.exchange_id == "bybit" and market_decision.reason_code:
-                    raise MarketRuleError(market_decision.reason_code, market_decision.reason or "unsupported market", 422)
-                raise HTTPException(status_code=422, detail=market_decision.reason)
+                    raise MarketRuleError(market_decision.reason_code, market_decision.reason or "unsupported market", 503 if market_decision.temporary else 422)
+                raise HTTPException(status_code=503 if market_decision.temporary else 422, detail=market_decision.reason)
             caps[symbol] = _close_market_cap(payload.exchange_id, symbol, quantity, instrument)
             if payload.exchange_id == "bybit" and instrument.get("status") != "active":
                 fresh_mark_price(adapter, symbol)
@@ -1201,10 +1224,27 @@ def close_positions(payload: PositionCloseRequest, response: Response, db: Db, _
                         raise MarketRuleError("order_book_unavailable", f"fresh order book is unavailable for {symbol}", 503) from exc
                     raise HTTPException(status_code=503, detail="market price is unavailable") from exc
 
+    db.rollback()
+    # Incremental requests hold the control lock only while registering one
+    # child per position. Eager v1 requests acquire it immediately before the
+    # final cancellation update and commit, after the large child batch.
+    if generation_mode == "incremental":
+        control = db.get(ControlFlag, 1, with_for_update=True)
+        if control is not None and control.kill_switch:
+            raise HTTPException(status_code=409, detail="kill switch is enabled")
+    positions = list(db.scalars(query.with_for_update()).all())
+    if [(item.id, Decimal(item.quantity), item.symbol) for item in positions] != position_snapshot:
+        raise HTTPException(status_code=409, detail="positions changed during close validation; retry with the same request_id")
+    for position in positions:
+        if active_parent_for_position(db, position.id) is not None:
+            raise HTTPException(status_code=409, detail="a close request is already active for this position")
+
     parent = CloseRequest(
+        id=str(uuid.uuid4()),
         request_id=payload.request_id, exchange_id=payload.exchange_id,
         symbol=canonical_symbol, submitted_symbol=payload.symbol,
         strategy_id=payload.strategy_id, status="queued" if positions else "completed",
+        generation_mode=generation_mode,
     )
     db.add(parent)
     try:
@@ -1212,28 +1252,42 @@ def close_positions(payload: PositionCloseRequest, response: Response, db: Db, _
         db.add(RequestKey(request_id=payload.request_id, operation_kind="close_request", target_id=parent.id))
         for position in positions:
             target = CloseRequestPosition(
+                id=str(uuid.uuid4()),
                 close_request_id=parent.id, position_id=position.id, symbol=position.symbol,
                 initial_position_quantity=position.quantity,
                 remaining_position_quantity=position.quantity, status="queued",
             )
             db.add(target)
             db.flush()
+            append_initial_children(
+                db, parent, target,
+                quantity=abs(Decimal(position.quantity)), cap=caps[position.symbol],
+                network=config.exchange_network,
+                incremental=generation_mode == "incremental",
+            )
+        db.flush()
+        if generation_mode == "eager":
+            try:
+                control = db.scalar(select(ControlFlag).where(ControlFlag.id == 1).with_for_update(nowait=True))
+            except OperationalError as exc:
+                if getattr(exc.orig, "sqlstate", None) == "55P03":
+                    db.rollback()
+                    raise HTTPException(status_code=409, detail="trading control is busy; retry with the same request_id") from exc
+                raise
+            if control is not None and control.kill_switch:
+                raise HTTPException(status_code=409, detail="kill switch is enabled")
+        for position in positions:
             db.execute(update(Order).where(
                 Order.exchange_id == payload.exchange_id,
                 Order.symbol == position.symbol,
+                Order.close_request_id.is_(None),
                 Order.status.in_(NON_TERMINAL_ORDER_STATUSES),
             ).values(cancellation_requested=True))
-            remaining = abs(Decimal(position.quantity))
-            cap = caps[position.symbol]
-            while remaining > 0:
-                chunk = min(remaining, cap)
-                append_child(db, parent, target, quantity=chunk, network=config.exchange_network)
-                remaining -= chunk
         db.commit()
     except IntegrityError:
         db.rollback()
         existing_parent = db.scalar(select(CloseRequest).where(CloseRequest.request_id == payload.request_id))
-        if existing_parent is not None and _same_close_input(existing_parent, payload):
+        if existing_parent is not None and existing_parent.generation_mode == generation_mode and _same_close_input(existing_parent, payload):
             response.status_code = 200
             return _close_view(db, existing_parent)
         raise HTTPException(status_code=409, detail="close request conflicts with an existing operation")
@@ -1243,6 +1297,7 @@ def close_positions(payload: PositionCloseRequest, response: Response, db: Db, _
     return _close_view(db, parent)
 
 
+@app.get("/api/v2/close-requests/{request_id}", response_model=CloseRequestView)
 @app.get("/api/v1/close-requests/{request_id}", response_model=CloseRequestView)
 def get_close_request(request_id: str, db: Db, _: Auth):
     parent = db.scalar(select(CloseRequest).where(CloseRequest.request_id == request_id))
@@ -1251,8 +1306,10 @@ def get_close_request(request_id: str, db: Db, _: Auth):
     return _close_view(db, parent)
 
 
+@app.post("/api/v2/close-requests/{request_id}/cancel", response_model=CloseRequestView, status_code=202)
 @app.post("/api/v1/close-requests/{request_id}/cancel", response_model=CloseRequestView, status_code=202)
 def cancel_close_request(request_id: str, response: Response, db: Db, _: Auth):
+    db.get(ControlFlag, 1, with_for_update=True)
     parent = db.scalar(select(CloseRequest).where(CloseRequest.request_id == request_id).with_for_update())
     if parent is None:
         raise HTTPException(status_code=404, detail="close request not found")
@@ -1441,11 +1498,26 @@ def set_kill_switch(payload: KillSwitchRequest, db: Db, _: Auth):
             Order.cancellation_requested.is_(False),
         ).values(cancellation_requested=True))
         cancellation_requested_count = int(result.rowcount or 0)
-        parents = list(db.scalars(select(CloseRequest).where(
+        db.execute(update(CloseRequest).where(
             CloseRequest.status.in_(ACTIVE_CLOSE_STATUSES)
-        ).with_for_update()).all())
-        for parent in parents:
-            cancel_parent(db, parent, "kill switch was enabled")
+        ).values(status="canceling", detail="kill switch was enabled"))
+        db.execute(update(CloseRequestPosition).where(
+            CloseRequestPosition.status.in_(ACTIVE_CLOSE_STATUSES)
+        ).values(status="canceling", detail="kill switch was enabled"))
+        db.execute(update(CloseRequestPosition).where(
+            CloseRequestPosition.status == "canceling",
+            ~select(Order.id).where(
+                Order.close_position_id == CloseRequestPosition.id,
+                Order.status.not_in(TERMINAL_ORDER_STATUSES),
+            ).exists(),
+        ).values(status="canceled"))
+        db.execute(update(CloseRequest).where(
+            CloseRequest.status == "canceling",
+            ~select(Order.id).where(
+                Order.close_request_id == CloseRequest.id,
+                Order.status.not_in(TERMINAL_ORDER_STATUSES),
+            ).exists(),
+        ).values(status="canceled"))
     db.commit()
     db.refresh(item)
     return _control_update_view(item, cancellation_requested_count)

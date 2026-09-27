@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Trade Ledger | ログイン</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/login.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">TL</span><div><p class="eyebrow">TRADE CONTAINER</p><h1>Trade Ledger</h1></div></div>
+    </header>
+    <main class="login-main">
+      <section class="trade-card login-card" aria-labelledby="login-title">
+        <p class="eyebrow">OPERATOR ACCESS</p>
+        <h2 id="login-title">ログイン</h2>
+        <form id="login-form">
+          <label for="ui-password">UIパスワード</label>
+          <input id="ui-password" type="password" autocomplete="current-password" required>
+          <button class="primary-button" type="submit">ログイン</button>
+        </form>
+        <p id="login-error" class="operation-message" role="alert" hidden></p>
+      </section>
+    </main>
+  </body>
+</html>

@@ -346,6 +346,84 @@ def test_bybit_close_request_splits_by_market_cap_and_can_be_canceled(market_cli
     assert looked_up.json()["status"] == "canceling"
 
 
+def test_v2_close_generates_children_incrementally_without_active_mark(market_client, sessions):
+    client, adapter = market_client
+    with sessions() as session:
+        session.add(Position(
+            exchange_id="bybit", symbol="BTCUSDT",
+            quantity=Decimal("51"), average_entry_price=Decimal("1000"),
+        ))
+        session.commit()
+    adapter.fetch_prices = lambda _symbols: (_ for _ in ()).throw(RuntimeError("Mark Price unavailable"))
+    snapshots = iter(range(1, 5))
+    adapter.fetch_order_book = lambda _symbol: {
+        "bids": [["1099", "60"]], "asks": [["1101", "60"]],
+        "_received_at": datetime.now(timezone.utc),
+        "_request_duration_seconds": 0.01,
+        "_market_data_id": str(next(snapshots)),
+    }
+
+    created = client.post("/api/v2/positions/close", json={
+        "request_id": "v2-active-close", "exchange_id": "bybit", "symbol": "BTCUSDT",
+    })
+    assert created.status_code == 202
+    assert created.json()["generation_mode"] == "incremental"
+    assert [Decimal(item["quantity"]) for item in created.json()["items"]] == [Decimal("50")]
+    replayed = client.post("/api/v2/positions/close", json={
+        "request_id": "v2-active-close", "exchange_id": "bybit", "symbol": "BTCUSDT",
+    })
+    assert replayed.status_code == 200
+    assert [item["id"] for item in replayed.json()["items"]] == [item["id"] for item in created.json()["items"]]
+    assert client.post("/api/v1/positions/close", json={
+        "request_id": "v2-active-close", "exchange_id": "bybit", "symbol": "BTCUSDT",
+    }).status_code == 409
+
+    worker = PaperExecutor(CONFIG, adapters=FakePool(CONFIG, adapter), sessions=sessions)
+    assert worker.process_once()
+    pending = client.get("/api/v2/close-requests/v2-active-close").json()
+    assert [Decimal(item["quantity"]) for item in pending["items"]] == [Decimal("50"), Decimal("1")]
+    restarted_worker = PaperExecutor(CONFIG, adapters=FakePool(CONFIG, adapter), sessions=sessions)
+    assert restarted_worker.process_once()
+    assert client.get("/api/v2/close-requests/v2-active-close").json()["status"] == "completed"
+    with sessions() as session:
+        assert session.scalar(select(Position).where(Position.symbol == "BTCUSDT")).quantity == Decimal("0")
+
+
+def test_v2_cancellation_stops_future_children(market_client, sessions):
+    client, adapter = market_client
+    with sessions() as session:
+        session.add(Position(
+            exchange_id="bybit", symbol="BTCUSDT",
+            quantity=Decimal("101"), average_entry_price=Decimal("1000"),
+        ))
+        session.commit()
+    snapshots = iter(range(1, 4))
+    adapter.fetch_order_book = lambda _symbol: {
+        "bids": [["1099", "60"]], "asks": [["1101", "60"]],
+        "_received_at": datetime.now(timezone.utc),
+        "_request_duration_seconds": 0.01,
+        "_market_data_id": str(next(snapshots)),
+    }
+    created = client.post("/api/v2/positions/close", json={
+        "request_id": "v2-cancel-after-first", "exchange_id": "bybit", "symbol": "BTCUSDT",
+    })
+    assert created.status_code == 202
+    worker = PaperExecutor(CONFIG, adapters=FakePool(CONFIG, adapter), sessions=sessions)
+    assert worker.process_once()
+    active = client.get("/api/v2/close-requests/v2-cancel-after-first").json()
+    assert [Decimal(item["quantity"]) for item in active["items"]] == [Decimal("50"), Decimal("50")]
+
+    canceled = client.post("/api/v2/close-requests/v2-cancel-after-first/cancel")
+    assert canceled.status_code == 202
+    assert canceled.json()["status"] == "canceling"
+    assert worker.process_once()
+    final = client.get("/api/v2/close-requests/v2-cancel-after-first").json()
+    assert final["status"] == "canceled"
+    assert len(final["items"]) == 2
+    with sessions() as session:
+        assert session.scalar(select(Position).where(Position.symbol == "BTCUSDT")).quantity == Decimal("51")
+
+
 def test_invalid_defined_max_qty_disables_new_orders(market_client):
     client, adapter = market_client
     original = adapter.fetch_instruments
@@ -367,6 +445,55 @@ def test_invalid_defined_max_qty_disables_new_orders(market_client):
     })
     assert order.status_code == 503
     assert order.json()["reason_code"] == "instrument_metadata_invalid"
+
+
+def test_bybit_limit_price_must_align_with_tick(market_client):
+    client, _adapter = market_client
+    response = client.post("/api/v1/orders", json={
+        "request_id": "off-tick", "exchange_id": "bybit", "symbol": "BTCUSDT",
+        "side": "buy", "order_type": "limit", "quantity": "0.01",
+        "limit_price": "1100.05",
+    })
+    assert response.status_code == 422
+    assert response.json()["reason_code"] == "price_step_not_aligned"
+
+
+def test_incomplete_bybit_market_metadata_does_not_terminally_reject_accepted_order(market_client, sessions):
+    client, adapter = market_client
+    original = adapter.fetch_instruments
+
+    def incomplete(symbol=None):
+        items = original(symbol)
+        items[0]["quote_asset"] = None
+        return items
+
+    adapter.fetch_instruments = incomplete
+    unavailable = client.post("/api/v1/orders", json={
+        "request_id": "metadata-preflight", "exchange_id": "bybit", "symbol": "BTCUSDT",
+        "side": "buy", "order_type": "market", "quantity": "0.01",
+    })
+    assert unavailable.status_code == 503
+    assert unavailable.json()["reason_code"] == "instrument_metadata_invalid"
+
+    with sessions() as session:
+        accepted = Order(
+            request_id="accepted-before-outage", exchange_id="bybit", exchange_network="mainnet",
+            symbol="BTCUSDT", side="buy", order_type="market", quantity=Decimal("0.01"),
+        )
+        session.add(accepted)
+        session.commit()
+        order_id = accepted.id
+
+    worker = PaperExecutor(
+        CONFIG, adapters=FakePool(CONFIG, adapter), sessions=sessions,
+        now=lambda: datetime.now(timezone.utc),
+    )
+    assert worker.process_once()
+    with sessions() as session:
+        order = session.get(Order, order_id)
+        assert order.status == "pending"
+        assert order.filled_quantity == 0
+        assert order.retry_count == 1
 
 
 def test_empty_bybit_defaults_still_allow_explicit_symbol(market_client):

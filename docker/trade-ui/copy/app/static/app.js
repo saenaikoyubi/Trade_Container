@@ -12,6 +12,8 @@ const state = {
   orderFillCursor: null,
   activeCloseRequestId: null,
   closePollTimer: null,
+  csrfToken: null,
+  pendingOperation: null,
   control: {
     kill_switch: false,
     close_only: false,
@@ -20,6 +22,12 @@ const state = {
 };
 
 const elements = {
+  logout: document.querySelector("#logout"),
+  pendingPanel: document.querySelector("#pending-operation"),
+  pendingStatus: document.querySelector("#pending-operation-status"),
+  pendingCheck: document.querySelector("#pending-check"),
+  pendingRetry: document.querySelector("#pending-retry"),
+  pendingAbandon: document.querySelector("#pending-abandon"),
   modeBadge: document.querySelector("#mode-badge"),
   controlReason: document.querySelector("#control-reason"),
   controlToggle: document.querySelector("#close-only-toggle"),
@@ -87,11 +95,103 @@ const statusLabels = {
   failed: "失敗",
 };
 const cancellableStatuses = new Set(["pending", "processing", "open", "partially_filled"]);
+const pendingStorageKey = "tradePendingOperation:v1";
 
 function requestId(prefix) {
   const identity = globalThis.crypto?.randomUUID?.()
     || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return `${prefix}-${identity}`;
+}
+
+function loadPendingOperation() {
+  const raw = window.localStorage.getItem(pendingStorageKey);
+  if (!raw) return null;
+  const operation = JSON.parse(raw);
+  if (!["order", "close"].includes(operation?.kind) || !operation.payload?.request_id) {
+    throw new Error("保存された未確定操作を読み取れません。注文を送信せず、管理者に確認してください。");
+  }
+  return operation;
+}
+
+function renderPendingOperation(message = null) {
+  const operation = state.pendingOperation;
+  elements.pendingPanel.hidden = !operation;
+  if (operation) {
+    const label = operation.kind === "order" ? "注文" : "全決済";
+    elements.pendingStatus.textContent = message || label + " " + operation.payload.request_id + " の結果を確認中です。別の操作を送る前に照合してください。";
+  }
+}
+
+function startOperation(kind, payload) {
+  const existing = loadPendingOperation();
+  if (existing) {
+    state.pendingOperation = existing;
+    renderPendingOperation();
+    const retried = {...payload, request_id: existing.payload.request_id};
+    if (existing.kind !== kind || JSON.stringify(existing.payload) !== JSON.stringify(retried)) {
+      throw new Error("未確定の操作 " + existing.payload.request_id + " があります。結果を照合してください。");
+    }
+    return existing;
+  }
+  const operation = {kind, payload};
+  window.localStorage.setItem(pendingStorageKey, JSON.stringify(operation));
+  state.pendingOperation = operation;
+  renderPendingOperation();
+  return operation;
+}
+
+function finishOperation() {
+  window.localStorage.removeItem(pendingStorageKey);
+  state.pendingOperation = null;
+  renderPendingOperation();
+}
+
+async function reconcilePendingOperation() {
+  const operation = state.pendingOperation;
+  if (!operation) return false;
+  const requestId = encodeURIComponent(operation.payload.request_id);
+  const url = operation.kind === "order"
+    ? "/ui-api/orders/by-request-id/" + requestId
+    : "/ui-api/close-requests/" + requestId;
+  let result;
+  try {
+    result = await fetchJson(url);
+  } catch (_error) {
+    renderPendingOperation("操作 " + operation.payload.request_id + " の受付は確認できませんでした。同じIDで再送するか、後で再照合してください。");
+    return false;
+  }
+  finishOperation();
+  if (operation.kind === "close") {
+    state.activeCloseRequestId = result.request_id;
+    window.sessionStorage.setItem("activeCloseRequestId", result.request_id);
+    renderCloseRequest(result);
+  }
+  showOperation(elements.orderMessage, "受付を確認しました: " + result.request_id, "success");
+  try { await loadOrders(false); } catch (error) { showError(error.message); }
+  return true;
+}
+
+async function retryPendingOperation() {
+  const operation = state.pendingOperation;
+  if (!operation) return;
+  const path = operation.kind === "order" ? "/ui-api/orders" : "/ui-api/positions/close";
+  let result;
+  try {
+    result = await postJson(path, operation.payload);
+  } catch (error) {
+    if (!await reconcilePendingOperation()) {
+      showOperation(elements.orderMessage, "結果が不明です: " + error.message, "error");
+    }
+    return;
+  }
+  finishOperation();
+  if (operation.kind === "close") {
+    state.activeCloseRequestId = result.request_id;
+    window.sessionStorage.setItem("activeCloseRequestId", result.request_id);
+    renderCloseRequest(result);
+  }
+  showOperation(elements.orderMessage, "受付を確認しました: " + result.request_id, "success");
+  try { await loadOrders(false); } catch (error) { showError(error.message); }
 }
 
 function utcDateString(offsetDays = 0) {
@@ -147,13 +247,14 @@ async function fetchJson(url, options = {}) {
     payload = null;
   }
   if (!response.ok) {
+    if (response.status === 401) window.location.assign("/");
     throw new Error(errorDetail(payload, `処理に失敗しました (${response.status})`));
   }
   return payload;
 }
 
 function postJson(url, payload = undefined) {
-  const options = { method: "POST" };
+  const options = { method: "POST", headers: {"X-CSRF-Token": state.csrfToken || ""} };
   if (payload !== undefined) options.body = JSON.stringify(payload);
   return fetchJson(url, options);
 }
@@ -420,6 +521,7 @@ function orderPayload() {
 
 async function submitOrder(event) {
   event.preventDefault();
+  let submitted = false;
   try {
     const payload = orderPayload();
     const detail = [
@@ -429,9 +531,12 @@ async function submitOrder(event) {
       payload.reduce_only ? "Reduce-only" : "新規建玉を許可",
     ].join("\n");
     if (!window.confirm(`${detail}\n\nこのPaper注文を送信しますか？`)) return;
+    const operation = startOperation("order", payload);
     elements.orderSubmit.disabled = true;
     elements.orderSubmit.textContent = "送信中…";
-    const order = await postJson("/ui-api/orders", payload);
+    submitted = true;
+    const order = await postJson("/ui-api/orders", operation.payload);
+    finishOperation();
     showOperation(
       elements.orderMessage,
       `注文を受け付けました: ${order.id}（${statusLabels[order.status] || order.status}）`,
@@ -441,7 +546,10 @@ async function submitOrder(event) {
     elements.orderLimitPrice.value = "";
     await loadOrders(false);
   } catch (error) {
-    showOperation(elements.orderMessage, error.message, "error");
+    if (submitted && state.pendingOperation && await reconcilePendingOperation()) return;
+    showOperation(elements.orderMessage, state.pendingOperation
+      ? (submitted ? "結果が不明です。操作ID " + state.pendingOperation.payload.request_id + " を再照合してください。" : error.message)
+      : error.message, "error");
   } finally {
     elements.orderSubmit.disabled = state.control.kill_switch;
     elements.orderSubmit.textContent = "注文内容を確認";
@@ -537,13 +645,21 @@ async function closePositions(exchangeId, symbol = null) {
     exchange_id: exchangeId,
   };
   if (symbol) payload.symbol = symbol;
-  const result = await postJson("/ui-api/positions/close", payload);
+  const operation = startOperation("close", payload);
+  let result;
+  try {
+    result = await postJson("/ui-api/positions/close", operation.payload);
+  } catch (error) {
+    if (await reconcilePendingOperation()) return;
+    throw new Error("全決済の結果が不明です。操作ID " + operation.payload.request_id + " を再照合してください。");
+  }
+  finishOperation();
   state.activeCloseRequestId = result.request_id;
   window.sessionStorage.setItem("activeCloseRequestId", result.request_id);
   renderCloseRequest(result);
   showOperation(
     elements.orderMessage,
-    `全決済処理 ${result.request_id} を受け付けました。子注文: ${result.items.length}件。`,
+    `全決済処理 ${result.request_id} を受け付けました。現在登録済みの子注文: ${result.items.length}件。残数量は処理状態で確認してください。`,
     "warning",
   );
   await loadOrders(false);
@@ -828,8 +944,42 @@ elements.dialogClose.addEventListener("click", () => elements.dialog.close());
 elements.dialog.addEventListener("click", (event) => {
   if (event.target === elements.dialog) elements.dialog.close();
 });
+elements.pendingCheck.addEventListener("click", reconcilePendingOperation);
+elements.pendingRetry.addEventListener("click", retryPendingOperation);
+elements.pendingAbandon.addEventListener("click", () => {
+  const operation = state.pendingOperation;
+  if (!operation) return;
+  if (!window.confirm("操作 " + operation.payload.request_id + " は受付済みの可能性があります。履歴を確認したうえで別の操作を開始しますか？")) return;
+  finishOperation();
+});
+elements.logout.addEventListener("click", async () => {
+  try {
+    await fetch("/auth/logout", {
+      method: "POST",
+      headers: {"X-CSRF-Token": state.csrfToken || ""},
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+  } finally {
+    window.location.assign("/");
+  }
+});
 
 async function initialize() {
+  const sessionResponse = await fetch("/auth/session", {cache: "no-store"});
+  if (!sessionResponse.ok) {
+    window.location.assign("/");
+    return;
+  }
+  state.csrfToken = (await sessionResponse.json()).csrf_token;
+  try {
+    state.pendingOperation = loadPendingOperation();
+    renderPendingOperation();
+  } catch (error) {
+    showError(error.message);
+    elements.orderSubmit.disabled = true;
+    elements.currentCloseAll.disabled = true;
+  }
   setQuickRange(30);
   setActiveTab("orders");
   resetCurrentPositions();
@@ -839,8 +989,9 @@ async function initialize() {
     showError(error instanceof Error ? error.message : "初期データを取得できませんでした。");
   }
   await loadAll();
+  if (state.pendingOperation) await reconcilePendingOperation();
   state.activeCloseRequestId = window.sessionStorage.getItem("activeCloseRequestId");
   if (state.activeCloseRequestId) pollCloseRequest();
 }
 
-initialize();
+initialize().catch((error) => showError(error.message || "初期化に失敗しました。"));

@@ -146,13 +146,16 @@ class DydxAdapter:
         return result if result.is_finite() and result > 0 else None
 
     def _market_from_raw(self, symbol: str, raw: dict[str, Any]) -> dict[str, Any]:
-        step = Decimal(str(raw.get("stepSize") or (Decimal(10) ** int(raw.get("atomicResolution", -8)))))
-        tick = Decimal(str(raw.get("tickSize") or "0.01"))
-        min_qty = self._positive(raw.get("minOrderSize")) or step
-        oracle_price = self._positive(raw.get("oraclePrice") or raw.get("indexPrice"))
-        min_notional = self._positive(raw.get("minNotional") or raw.get("minOrderValue"))
-        if min_notional is None and min_qty is not None and oracle_price is not None:
-            min_notional = min_qty * oracle_price
+        step = self._positive(raw.get("stepSize"))
+        if raw.get("stepSize") is None and raw.get("atomicResolution") is not None:
+            try:
+                step = self._positive(Decimal(10) ** int(raw["atomicResolution"]))
+            except (ArithmeticError, TypeError, ValueError):
+                step = None
+        tick = self._positive(raw.get("tickSize"))
+        min_qty = self._positive(raw.get("minOrderSize"))
+        raw_min_notional = raw.get("minNotional") if raw.get("minNotional") is not None else raw.get("minOrderValue")
+        min_notional = self._positive(raw_min_notional)
         return {
             "id": symbol,
             "symbol": symbol,
@@ -161,7 +164,7 @@ class DydxAdapter:
             "base": symbol.split("-", 1)[0],
             "quote": "USD",
             "settle": "USDC",
-            "precision": {"amount": str(step), "price": str(tick)},
+            "precision": {"amount": str(step) if step is not None else None, "price": str(tick) if tick is not None else None},
             "limits": {"amount": {"min": min_qty}, "cost": {"min": min_notional}},
             "info": raw,
         }
@@ -178,6 +181,11 @@ class DydxAdapter:
         amount_limits = (market.get("limits") or {}).get("amount") or {}
         cost_limits = (market.get("limits") or {}).get("cost") or {}
         max_qty = Decimal(str(amount_limits.get("max"))) if amount_limits.get("max") is not None else None
+        invalid_fields = []
+        for field, value in (("qty_step", raw.get("stepSize")), ("min_qty", raw.get("minOrderSize")),
+                             ("price_step", raw.get("tickSize")), ("min_notional", raw.get("minNotional") if raw.get("minNotional") is not None else raw.get("minOrderValue"))):
+            if value is not None and self._positive(value) is None:
+                invalid_fields.append(field)
         return {
             "exchange_id": self.exchange_id,
             "symbol": symbol,
@@ -186,14 +194,15 @@ class DydxAdapter:
             "settle_asset": market.get("settle"),
             "contract_type": "perpetual",
             "contract_size": Decimal("1"),
-            "qty_step": Decimal(str((market.get("precision") or {}).get("amount"))),
+            "qty_step": self._positive((market.get("precision") or {}).get("amount")),
             "min_qty": Decimal(str(amount_limits.get("min"))) if amount_limits.get("min") is not None else None,
             "max_qty": max_qty,
             "max_market_qty": max_qty,
-            "price_step": Decimal(str((market.get("precision") or {}).get("price"))),
+            "price_step": self._positive((market.get("precision") or {}).get("price")),
             "min_notional": Decimal(str(cost_limits.get("min"))) if cost_limits.get("min") is not None else None,
             "quantity_unit": market.get("base"),
             "status": status,
+            "_invalid_fields": invalid_fields,
         }
 
     def _refresh_instruments(self) -> None:
@@ -228,10 +237,18 @@ class DydxAdapter:
 
     def fetch_instruments(self, symbol: str | None = None) -> list[dict[str, Any]]:
         self._refresh_instruments()
+        age = self.metadata_age_seconds
+        stale = age is not None and age > METADATA_TTL_SECONDS
+        def view(canonical: str) -> dict[str, Any]:
+            return {
+                **self._metadata_cache[canonical],
+                "metadata_age_seconds": age,
+                "metadata_stale": stale,
+            }
         if symbol is not None:
             canonical = self.resolve_symbol(symbol)
-            return [dict(self._metadata_cache[canonical])]
-        return [dict(self._metadata_cache[item]) for item in self.config.symbols]
+            return [view(canonical)]
+        return [view(item) for item in self.config.symbols]
 
     def _fetch_price(self, symbol: str) -> dict[str, Any]:
         book = self.fetch_order_book(symbol)

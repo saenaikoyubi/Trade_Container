@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -175,6 +176,91 @@ def test_market_partial_fill_cancels_remainder(sessions):
         assert order.filled_quantity == Decimal("1")
         assert fill.liquidity_role == "taker"
         assert fill.market_data_id == "book-1"
+
+
+def test_market_fill_uses_all_book_levels_for_hard_notional_cap(sessions):
+    order_id = add_order(sessions, quantity=Decimal("2"))
+    config = replace(CONFIG, max_order_notional=Decimal("250"))
+    worker = PaperExecutor(
+        config,
+        adapters=FakeAdapterPool({"fake": FakeExchange(book(
+            "book-1", asks=[["100", "1"], ["200", "1"]],
+        ))}, config=config),
+        sessions=sessions, now=lambda: NOW,
+    )
+
+    worker.process_once()
+
+    with sessions() as session:
+        order = session.get(Order, order_id)
+        assert order.status == "rejected"
+        assert "maximum cumulative order notional" in order.rejection_reason
+        assert order.filled_quantity == 0
+        assert session.scalars(select(Fill).where(Fill.order_id == order_id)).all() == []
+
+
+def test_partial_limit_cancels_only_remainder_at_cumulative_cap(sessions):
+    order_id = add_order(
+        sessions, order_type="limit", quantity=Decimal("2"), limit_price=Decimal("110"),
+    )
+    exchange = FakeExchange(
+        book("book-1", asks=[["100", "1"]]),
+        book("book-2", asks=[["110", "1"]]),
+    )
+    config = replace(CONFIG, max_order_notional=Decimal("205"))
+    worker = PaperExecutor(
+        config, adapters=FakeAdapterPool({"fake": exchange}, config=config),
+        sessions=sessions, now=lambda: NOW,
+    )
+
+    worker.process_once()
+    worker.process_once()
+
+    with sessions() as session:
+        order = session.get(Order, order_id)
+        fills = session.scalars(select(Fill).where(Fill.order_id == order_id)).all()
+        assert order.status == "canceled"
+        assert order.filled_quantity == Decimal("1")
+        assert len(fills) == 1
+        assert fills[0].price == Decimal("100")
+
+
+def test_partial_limit_residual_below_minimum_can_complete(sessions):
+    order_id = add_order(
+        sessions, order_type="limit", quantity=Decimal("2"), limit_price=Decimal("110"),
+    )
+    worker = executor(sessions, FakeExchange(
+        book("book-1", asks=[["100", "1.5"]]),
+        book("book-2", asks=[["100", "0.5"]]),
+    ))
+
+    worker.process_once()
+    worker.process_once()
+
+    with sessions() as session:
+        order = session.get(Order, order_id)
+        assert order.status == "filled"
+        assert order.filled_quantity == Decimal("2")
+        assert len(session.scalars(select(Fill).where(Fill.order_id == order_id)).all()) == 2
+
+
+@pytest.mark.parametrize("asks", [
+    [["100", "1"], ["101", "0"]],
+    [["100", "1"], "12"],
+])
+def test_invalid_deep_book_level_defers_without_fill(sessions, asks):
+    order_id = add_order(sessions, quantity=Decimal("2"))
+    worker = executor(sessions, FakeExchange(book(
+        "book-1", asks=asks,
+    )))
+
+    worker.process_once()
+
+    with sessions() as session:
+        order = session.get(Order, order_id)
+        assert order.status == "pending"
+        assert order.filled_quantity == 0
+        assert session.scalars(select(Fill).where(Fill.order_id == order_id)).all() == []
 
 
 def test_limit_rests_then_fills_as_maker(sessions):

@@ -3,17 +3,11 @@ from __future__ import annotations
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from .market_rules import ACTIVE_CLOSE_STATUSES, TERMINAL_ORDER_STATUSES
 from .models import CloseRequest, CloseRequestPosition, Order, Position, RequestKey
-
-
-def children(session: Session, close_position_id: str) -> list[Order]:
-    return list(session.scalars(
-        select(Order).where(Order.close_position_id == close_position_id).order_by(Order.close_sequence)
-    ).all())
 
 
 def all_children(session: Session, parent_id: str) -> list[Order]:
@@ -26,8 +20,7 @@ def append_child(
     session: Session, parent: CloseRequest, target: CloseRequestPosition,
     *, quantity: Decimal, network: str,
 ) -> Order:
-    existing = children(session, target.id)
-    sequence = max((item.close_sequence or 0 for item in existing), default=0) + 1
+    sequence = (session.scalar(select(func.max(Order.close_sequence)).where(Order.close_position_id == target.id)) or 0) + 1
     request_id = f"close-child:{parent.id}:{target.id}:{sequence}"
     order = Order(
         id=str(uuid.uuid4()), request_id=request_id, strategy_id=parent.strategy_id,
@@ -42,20 +35,55 @@ def append_child(
     return order
 
 
+def append_initial_children(
+    session: Session, parent: CloseRequest, target: CloseRequestPosition,
+    *, quantity: Decimal, cap: Decimal, network: str, incremental: bool,
+) -> None:
+    """Stage initial children with one flush, even for a large v1 close."""
+    pending = []
+    remaining = quantity
+    sequence = 0
+    while remaining > 0:
+        sequence += 1
+        chunk = min(remaining, cap)
+        order_id = str(uuid.uuid4())
+        request_id = f"close-child:{parent.id}:{target.id}:{sequence}"
+        pending.extend((
+            Order(
+                id=order_id, request_id=request_id, strategy_id=parent.strategy_id,
+                exchange_id=parent.exchange_id, exchange_network=network,
+                symbol=target.symbol, side="sell" if target.remaining_position_quantity > 0 else "buy",
+                order_type="market", quantity=chunk, reduce_only=True,
+                close_request_id=parent.id, close_position_id=target.id, close_sequence=sequence,
+            ),
+            RequestKey(request_id=request_id, operation_kind="order", target_id=order_id),
+        ))
+        remaining -= chunk
+        if incremental:
+            break
+    session.add_all(pending)
+
+
 def refresh_target(session: Session, target: CloseRequestPosition) -> None:
     position = session.get(Position, target.position_id)
     target.remaining_position_quantity = Decimal(position.quantity) if position is not None else Decimal("0")
     if target.status == "failed":
         return
-    current_children = children(session, target.id)
-    active = [item for item in current_children if item.status not in TERMINAL_ORDER_STATUSES]
+    active = session.scalar(select(Order.id).where(
+        Order.close_position_id == target.id,
+        Order.status.not_in(TERMINAL_ORDER_STATUSES),
+    ).limit(1)) is not None
     if target.status == "canceling":
         target.status = "canceling" if active else "canceled"
     elif target.remaining_position_quantity == 0:
         target.status = "running" if active else "completed"
         target.reason_code = target.detail = None
     elif active:
-        target.status = "running" if any(item.status in {"processing", "open", "partially_filled"} for item in active) else "queued"
+        progressing = session.scalar(select(Order.id).where(
+            Order.close_position_id == target.id,
+            Order.status.in_(("processing", "open", "partially_filled")),
+        ).limit(1)) is not None
+        target.status = "running" if progressing else "queued"
         target.reason_code = target.detail = None
     else:
         target.status = "waiting"
@@ -65,7 +93,10 @@ def refresh_parent(session: Session, parent: CloseRequest) -> None:
     targets = list(session.scalars(
         select(CloseRequestPosition).where(CloseRequestPosition.close_request_id == parent.id)
     ).all())
-    has_active_children = any(item.status not in TERMINAL_ORDER_STATUSES for item in all_children(session, parent.id))
+    has_active_children = session.scalar(select(Order.id).where(
+        Order.close_request_id == parent.id,
+        Order.status.not_in(TERMINAL_ORDER_STATUSES),
+    ).limit(1)) is not None
     if parent.status == "canceling":
         if not has_active_children:
             parent.status = "canceled"
@@ -104,9 +135,10 @@ def cancel_parent(session: Session, parent: CloseRequest, detail: str) -> None:
         if target.status not in {"completed", "failed", "canceled"}:
             target.status = "canceling"
             target.detail = detail
-    for item in all_children(session, parent.id):
-        if item.status not in TERMINAL_ORDER_STATUSES:
-            item.cancellation_requested = True
+    session.execute(update(Order).where(
+        Order.close_request_id == parent.id,
+        Order.status.not_in(TERMINAL_ORDER_STATUSES),
+    ).values(cancellation_requested=True))
     session.flush()
     for target in targets:
         refresh_target(session, target)

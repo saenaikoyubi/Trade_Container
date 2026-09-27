@@ -1,14 +1,18 @@
 from decimal import Decimal
+import time
 
 import pytest
 
 from trade_common.config import ExchangeSettings
 from trade_common.exchange_adapters.ccxt_adapter import CcxtAdapter
 from trade_common.market_rules import MarketRuleError
+from trade_common.risk import validate_instrument_market
 
 
 def test_bybit_resolves_unconfigured_linear_market_from_catalog(monkeypatch):
     class FakeBybit:
+        precisionMode = 2
+
         def __init__(self, _params):
             self.markets = {
                 "ETH/USDT:USDT": {
@@ -16,7 +20,8 @@ def test_bybit_resolves_unconfigured_linear_market_from_catalog(monkeypatch):
                     "linear": True, "active": True, "base": "ETH", "quote": "USDT",
                     "settle": "USDT", "precision": {"amount": 0.01},
                     "limits": {"amount": {"min": 0.01}},
-                    "info": {"lotSizeFilter": {"maxMktOrderQty": "20"}},
+                    "info": {"lotSizeFilter": {"maxMktOrderQty": "20"},
+                             "priceFilter": {"tickSize": "1"}},
                 },
                 "ADA/USDT": {
                     "id": "ADAUSDT", "symbol": "ADA/USDT", "spot": True,
@@ -38,12 +43,35 @@ def test_bybit_resolves_unconfigured_linear_market_from_catalog(monkeypatch):
     assert adapter.fetch_instruments() == []
     assert adapter.resolve_symbol("ETH/USDT:USDT") == "ETHUSDT"
     assert adapter.fetch_instruments("ETHUSDT")[0]["max_market_qty"] == Decimal("20")
+    assert adapter.fetch_instruments("ETHUSDT")[0]["price_step"] == Decimal("1")
     with pytest.raises(MarketRuleError) as unsupported:
         adapter.resolve_symbol("ADAUSDT")
     assert unsupported.value.reason_code == "unsupported_market"
     with pytest.raises(MarketRuleError) as unknown:
         adapter.resolve_symbol("DOGEUSDT")
     assert unknown.value.reason_code == "unknown_symbol"
+
+
+def test_known_bybit_market_with_incomplete_catalog_fields_is_temporary(monkeypatch):
+    class IncompleteBybit:
+        def __init__(self, _params):
+            self.markets = {"BTC/USDT:USDT": {
+                "id": "BTCUSDT", "symbol": "BTC/USDT:USDT",
+                "swap": True, "linear": None, "quote": "USDT", "settle": "USDT",
+            }}
+
+        def load_markets(self, *args, **kwargs):
+            return self.markets
+
+    monkeypatch.setattr("trade_common.exchange_adapters.ccxt_adapter.ccxt.bybit", IncompleteBybit)
+    adapter = CcxtAdapter(ExchangeSettings(
+        exchange_id="bybit", adapter="ccxt", symbols=(),
+        taker_fee_rate=Decimal("0.001"), maker_fee_rate=Decimal("0.001"),
+    ))
+    with pytest.raises(MarketRuleError) as incomplete:
+        adapter.resolve_symbol("BTCUSDT")
+    assert incomplete.value.status_code == 503
+    assert incomplete.value.reason_code == "instrument_metadata_invalid"
 
 
 def test_empty_bybit_catalog_does_not_report_metadata_ready(monkeypatch):
@@ -192,3 +220,44 @@ def test_bybit_instrument_metadata_fallback_lot_size_filter(monkeypatch):
     assert instrument["max_qty"] == Decimal("1500.0")
     assert instrument["max_market_qty"] == Decimal("150.0")
     assert instrument["quantity_unit"] == "BTC"
+
+
+def test_binance_stale_metadata_allows_only_reduce_only_for_24_hours(monkeypatch):
+    class FakeBinance:
+        precisionMode = 4
+
+        def __init__(self, _params):
+            self.markets = {"BTC/USDT": {
+                "id": "BTCUSDT", "symbol": "BTC/USDT", "spot": True,
+                "active": True, "base": "BTC", "quote": "USDT",
+                "precision": {"amount": 0.00001, "price": 0.01},
+                "limits": {"amount": {"min": 0.00001}, "cost": {"min": 5}},
+            }}
+            self.fail_refresh = False
+
+        def load_markets(self, *args, **kwargs):
+            if self.fail_refresh:
+                raise RuntimeError("exchange unavailable")
+            return self.markets
+
+    monkeypatch.setattr("trade_common.exchange_adapters.ccxt_adapter.ccxt.binance", FakeBinance)
+    adapter = CcxtAdapter(ExchangeSettings(
+        exchange_id="binance", adapter="ccxt", symbols=("BTC/USDT",),
+        taker_fee_rate=Decimal("0.001"), maker_fee_rate=Decimal("0.001"),
+    ))
+    adapter.client.fail_refresh = True
+    adapter._metadata_loaded_at = time.monotonic() - 3601
+    stale = adapter.fetch_instruments("BTC/USDT")[0]
+    assert stale["metadata_stale"] is True
+    assert stale["metadata_age_seconds"] > 3600
+    assert not validate_instrument_market(
+        stale, exchange_id="binance", order_type="market", reduce_only=False,
+        position_quantity=Decimal("0"), side="buy", quantity=Decimal("1"),
+    ).allowed
+    assert validate_instrument_market(
+        stale, exchange_id="binance", order_type="market", reduce_only=True,
+        position_quantity=Decimal("1"), side="sell", quantity=Decimal("1"),
+    ).allowed
+    adapter._metadata_loaded_at = time.monotonic() - (24 * 3600 + 1)
+    with pytest.raises(RuntimeError, match="exchange unavailable"):
+        adapter.fetch_instruments("BTC/USDT")

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from trade_common.config import Settings
 
 
@@ -107,3 +109,54 @@ def test_empty_exchange_and_bybit_default_symbol_lists_are_allowed(tmp_path):
     config = Settings.from_file(config_file)
     assert config.exchanges["bybit"].symbols == ()
     assert config.exchanges["bybit"].metadata_ttl_seconds == 120
+
+
+@pytest.mark.parametrize("section,key,value", [
+    ("risk", "max_order_notional", "Infinity"),
+    ("risk", "max_daily_loss", "NaN"),
+    ("risk", "max_order_quantity", "0"),
+    ("risk", "max_orders_per_minute", 0),
+    ("account", "default_leverage", "Infinity"),
+    ("account", "initial_balance", "NaN"),
+    ("root", "market_data_max_age_seconds", float("nan")),
+    ("root", "poll_interval_seconds", 0),
+])
+def test_invalid_numeric_settings_fail_closed(tmp_path, section, key, value):
+    payload = {
+        "exchanges": {},
+        "risk": {
+            "max_order_quantity": "10", "max_order_notional": "50000",
+            "max_position_notional": "100000", "max_daily_loss": "5000",
+            "max_price_deviation_pct": "0.05", "max_orders_per_minute": 60,
+        },
+        "account": {"initial_balance": "10000", "default_leverage": "10"},
+    }
+    target = payload if section == "root" else payload[section]
+    target[key] = value
+    config_file = tmp_path / "settings.json"
+    config_file.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match=key):
+        Settings.from_file(config_file)
+
+
+@pytest.mark.parametrize("fees,ttl", [
+    ({"maker": "NaN", "taker": "0.001"}, 300),
+    ({"maker": "0.001", "taker": "1.1"}, 300),
+    ({"maker": "0.001", "taker": "0.001"}, float("inf")),
+])
+def test_invalid_exchange_numeric_settings_fail_closed(tmp_path, fees, ttl):
+    payload = {
+        "exchanges": {"bybit": {
+            "adapter": "ccxt", "symbols": [], "fees": fees,
+            "metadata_ttl_seconds": ttl,
+        }},
+        "risk": {
+            "max_order_quantity": "10", "max_order_notional": "50000",
+            "max_position_notional": "100000", "max_daily_loss": "5000",
+            "max_price_deviation_pct": "0.05", "max_orders_per_minute": 60,
+        },
+    }
+    config_file = tmp_path / "settings.json"
+    config_file.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError):
+        Settings.from_file(config_file)

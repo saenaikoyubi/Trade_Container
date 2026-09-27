@@ -49,6 +49,15 @@ def test_order_book_midpoint_rejects_stale_and_empty_data():
         )
     with pytest.raises(ValuationError, match="empty"):
         order_book_midpoint({"bids": [], "asks": [], "_received_at": now}, now=now, max_age_seconds=10)
+    with pytest.raises(ValuationError, match="future"):
+        order_book_midpoint(
+            {"bids": [["99", "1"]], "asks": [["101", "1"]], "_received_at": now + timedelta(seconds=3)},
+            now=now, max_age_seconds=10,
+        )
+    assert order_book_midpoint(
+        {"bids": [["99", "1"]], "asks": [["101", "1"]], "_received_at": now + timedelta(seconds=2)},
+        now=now, max_age_seconds=10,
+    )[0] == Decimal("100")
 
 
 def test_flat_position_has_no_side_and_invalid_average_is_rejected():

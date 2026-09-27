@@ -922,3 +922,11 @@ tbody tr[data-order-id]:focus {
     transition: none !important;
   }
 }
+/* Authentication and unresolved operation controls. */
+.login-main { min-height: 70vh; display: grid; place-items: center; }
+.login-card { width: min(100%, 420px); }
+.login-card form { display: grid; gap: 1rem; margin-top: 1rem; }
+.login-card input { width: 100%; padding: .8rem; }
+#pending-operation { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }
+#pending-operation[hidden] { display: none; }
+#pending-operation-status { flex-basis: 100%; }

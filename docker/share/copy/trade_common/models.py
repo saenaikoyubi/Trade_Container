@@ -98,6 +98,7 @@ class CloseRequest(Base):
     submitted_symbol: Mapped[str | None] = mapped_column(String(64))
     strategy_id: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(20), default="queued", nullable=False)
+    generation_mode: Mapped[str] = mapped_column(String(16), default="eager", nullable=False)
     reason_code: Mapped[str | None] = mapped_column(String(64))
     detail: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

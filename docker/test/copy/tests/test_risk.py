@@ -28,7 +28,7 @@ CONFIG = Settings(
 )
 
 
-def test_rejects_order_notional_over_limit():
+def test_estimated_notional_does_not_reject_before_actual_fill_is_known():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
@@ -43,8 +43,7 @@ def test_rejects_order_notional_over_limit():
         session.add(order)
         session.flush()
         decision = evaluate_order(session, order, Decimal("600"), CONFIG, EXCHANGE)
-        assert decision.allowed is False
-        assert decision.reason == "maximum order notional exceeded"
+        assert decision.allowed is True
 
 
 def test_allows_order_within_limits():

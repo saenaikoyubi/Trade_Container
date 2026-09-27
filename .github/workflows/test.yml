@@ -1,0 +1,19 @@
+name: Trade Container tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TRADE_SECRETS_DIR: /tmp/trade-container-ci-unused
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unit and isolated PostgreSQL recovery tests
+        run: docker compose -f docker/compose.yaml --profile tools run --build --rm test
+      - name: Stop isolated test databases
+        if: always()
+        run: docker compose -f docker/compose.yaml --profile tools stop postgres-test postgres-test-restore

@@ -8,6 +8,7 @@ port="${POSTGRES_PORT:-5432}"
 database="${POSTGRES_DB:-trade_restore}"
 user="${POSTGRES_USER:-trade}"
 password_file="${DATABASE_PASSWORD_FILE:-/run/secrets/postgres_password}"
+backup_dir="${BACKUP_DIR:-/backup}"
 
 if [ "$confirm" != "isolated" ]; then
   echo "RESTORE_CONFIRM=isolated is required" >&2
@@ -29,9 +30,9 @@ if [ ! -s "$password_file" ]; then
   exit 1
 fi
 
-archive="/backup/$backup_file"
+archive="$backup_dir/$backup_file"
 checksum_file="$archive.sha256"
-metadata_file="/backup/${backup_file%.dump}.metadata"
+metadata_file="$backup_dir/${backup_file%.dump}.metadata"
 for required in "$archive" "$checksum_file" "$metadata_file"; do
   if [ ! -r "$required" ]; then
     echo "required restore file is missing: $required" >&2
@@ -40,7 +41,7 @@ for required in "$archive" "$checksum_file" "$metadata_file"; do
 done
 
 export PGPASSWORD="$(cat "$password_file")"
-(cd /backup && sha256sum -c "$backup_file.sha256")
+(cd "$backup_dir" && sha256sum -c "$backup_file.sha256")
 pg_restore --list "$archive" >/dev/null
 
 attempt=1

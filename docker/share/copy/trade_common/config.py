@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +30,38 @@ def load_json(path: str | Path) -> dict[str, Any]:
         return json.load(handle)
 
 
-def decimal_value(value: Any) -> Decimal:
-    return Decimal(str(value))
+def decimal_value(value: Any, name: str, *, allow_zero: bool = False) -> Decimal:
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite decimal") from exc
+    if not result.is_finite() or result < 0 or (not allow_zero and result == 0):
+        raise ValueError(f"{name} must be finite and {'non-negative' if allow_zero else 'positive'}")
+    return result
+
+
+def positive_float(value: Any, name: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite positive number") from exc
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return result
+
+
+def positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if str(value) != str(result):
+        raise ValueError(f"{name} must be a positive integer")
+    if result <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return result
 
 
 @dataclass(frozen=True)
@@ -73,9 +104,7 @@ class Settings:
     def from_file(cls, path: str | Path) -> "Settings":
         raw = load_json(path)
         risk = raw["risk"]
-        market_data_max_age_seconds = float(raw.get("market_data_max_age_seconds", 10.0))
-        if market_data_max_age_seconds <= 0:
-            raise ValueError("market_data_max_age_seconds must be positive")
+        market_data_max_age_seconds = positive_float(raw.get("market_data_max_age_seconds", 10.0), "market_data_max_age_seconds")
         raw_exchanges = raw.get("exchanges")
         if not isinstance(raw_exchanges, dict):
             raise ValueError("exchanges must be an object")
@@ -99,16 +128,14 @@ class Settings:
             options = exchange_raw.get("options", {})
             if not isinstance(options, dict):
                 raise ValueError(f"exchange options must be an object: {exchange_id}")
-            metadata_ttl_seconds = float(exchange_raw.get("metadata_ttl_seconds", 300))
-            if metadata_ttl_seconds <= 0:
-                raise ValueError(f"metadata_ttl_seconds must be positive: {exchange_id}")
+            metadata_ttl_seconds = positive_float(exchange_raw.get("metadata_ttl_seconds", 300), f"metadata_ttl_seconds: {exchange_id}")
             fees = exchange_raw.get("fees")
             if not isinstance(fees, dict):
                 raise ValueError(f"exchange fees must be configured: {exchange_id}")
-            maker_fee_rate = decimal_value(fees["maker"])
-            taker_fee_rate = decimal_value(fees["taker"])
-            if maker_fee_rate < 0 or taker_fee_rate < 0:
-                raise ValueError(f"exchange fees must not be negative: {exchange_id}")
+            maker_fee_rate = decimal_value(fees["maker"], f"maker fee: {exchange_id}", allow_zero=True)
+            taker_fee_rate = decimal_value(fees["taker"], f"taker fee: {exchange_id}", allow_zero=True)
+            if maker_fee_rate > 1 or taker_fee_rate > 1:
+                raise ValueError(f"exchange fees must not exceed one: {exchange_id}")
             exchanges[exchange_id] = ExchangeSettings(
                 exchange_id=exchange_id,
                 adapter=adapter,
@@ -124,25 +151,20 @@ class Settings:
         if not isinstance(account_raw, dict):
             raise ValueError("account must be an object")
         currency = str(account_raw.get("currency", "USDT"))
-        initial_balance = decimal_value(account_raw.get("initial_balance", "10000.0"))
-        default_leverage = decimal_value(account_raw.get("default_leverage", "10.0"))
+        initial_balance = decimal_value(account_raw.get("initial_balance", "10000.0"), "account initial_balance", allow_zero=True)
+        default_leverage = decimal_value(account_raw.get("default_leverage", "10.0"), "account default_leverage")
         if currency not in {"USD", "USDC", "USDT"}:
             raise ValueError("account currency must be one of USD, USDC, or USDT")
-        if initial_balance < 0:
-            raise ValueError("account initial_balance must not be negative")
-        if default_leverage <= 0:
-            raise ValueError("account default_leverage must be positive")
-
         return cls(
             exchanges=exchanges,
-            poll_interval_seconds=float(raw.get("poll_interval_seconds", 1.0)),
+            poll_interval_seconds=positive_float(raw.get("poll_interval_seconds", 1.0), "poll_interval_seconds"),
             market_data_max_age_seconds=market_data_max_age_seconds,
-            max_order_quantity=decimal_value(risk["max_order_quantity"]),
-            max_order_notional=decimal_value(risk["max_order_notional"]),
-            max_position_notional=decimal_value(risk["max_position_notional"]),
-            max_daily_loss=decimal_value(risk["max_daily_loss"]),
-            max_price_deviation_pct=decimal_value(risk["max_price_deviation_pct"]),
-            max_orders_per_minute=int(risk["max_orders_per_minute"]),
+            max_order_quantity=decimal_value(risk["max_order_quantity"], "max_order_quantity"),
+            max_order_notional=decimal_value(risk["max_order_notional"], "max_order_notional"),
+            max_position_notional=decimal_value(risk["max_position_notional"], "max_position_notional"),
+            max_daily_loss=decimal_value(risk["max_daily_loss"], "max_daily_loss"),
+            max_price_deviation_pct=decimal_value(risk["max_price_deviation_pct"], "max_price_deviation_pct", allow_zero=True),
+            max_orders_per_minute=positive_int(risk["max_orders_per_minute"], "max_orders_per_minute"),
             exchange_network="mainnet",
             account=AccountSettings(
                 currency=currency,

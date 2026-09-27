@@ -9,14 +9,14 @@ from decimal import Decimal
 from typing import Callable
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 
 from .config import ExchangeSettings, Settings
-from .close_service import append_child, children, refresh_parent, refresh_target
+from .close_service import append_child, refresh_parent, refresh_target
 from .database import session_factory
 from .exchange_adapters import ExchangeAdapterPool
 from .market_rules import MarketRuleError, TERMINAL_ORDER_STATUSES, fresh_mark_price, positive_decimal
-from .models import CloseRequest, CloseRequestPosition, ControlFlag, Order, Position
+from .models import CloseRequest, CloseRequestPosition, ControlFlag, Fill, Order, Position
 from .repository import claim_order, heartbeat, record_fill
 from .risk import evaluate_order, validate_instrument_market
 from .simulation import simulate_order
@@ -82,6 +82,41 @@ class PaperExecutor:
                 return
             exchange_id, symbol = snapshot.exchange_id, snapshot.symbol
             parent_id, target_id = snapshot.close_request_id, snapshot.close_position_id
+            reduce_only, order_type = snapshot.reduce_only, snapshot.order_type
+            control_snapshot = snapshot_session.get(ControlFlag, 1)
+            skip_public_data = bool(snapshot.cancellation_requested or (control_snapshot and control_snapshot.kill_switch))
+
+        # Fetch public data without holding the rows that serialize fills and
+        # trading controls. The transaction below rechecks every mutable state.
+        exchange_config = self.config.exchange(exchange_id)
+        instrument = book = None
+        mark_price = mark_observed_at = None
+        external_error = None
+        external_stage = "instrument metadata"
+        if not skip_public_data and exchange_config is not None and (exchange_id == "bybit" or symbol in exchange_config.symbols):
+            try:
+                adapter = self.adapters.get(exchange_id)
+                instruments = adapter.fetch_instruments(symbol)
+                if not instruments:
+                    raise RuntimeError("instrument metadata is unavailable")
+                instrument = instruments[0]
+                supported_bybit = (
+                    instrument.get("contract_type") == "linear_perpetual"
+                    and instrument.get("quote_asset") == "USDT"
+                    and instrument.get("settle_asset") == "USDT"
+                )
+                needs_mark = exchange_id == "bybit" and supported_bybit and (
+                    (instrument.get("status") == "active" and parent_id is None)
+                    or (instrument.get("status") != "active" and reduce_only and order_type == "market")
+                )
+                if needs_mark:
+                    external_stage = "Mark Price"
+                    mark_price, mark_observed_at = fresh_mark_price(adapter, symbol)
+                if exchange_id != "bybit" or (supported_bybit and instrument.get("status") == "active"):
+                    external_stage = "market data"
+                    book = adapter.fetch_order_book(symbol)
+            except Exception as exc:
+                external_error = exc
         with self.sessions() as session:
             control = session.get(ControlFlag, 1, with_for_update=True)
             if control is None:
@@ -103,7 +138,6 @@ class PaperExecutor:
                 session.commit()
                 return
 
-            exchange_config = self.config.exchange(order.exchange_id)
             if exchange_config is None:
                 self._reject(order, "configured exchange is unavailable")
                 self._fail_close_target(session, parent, target, "exchange_not_configured", "configured exchange is unavailable")
@@ -121,29 +155,23 @@ class PaperExecutor:
                 order.exchange_id,
                 order.symbol,
             )
-            try:
-                adapter = self.adapters.get(order.exchange_id)
-                instruments = adapter.fetch_instruments(order.symbol)
-                if not instruments:
-                    raise RuntimeError("instrument metadata is unavailable")
-                instrument = instruments[0]
-            except MarketRuleError as exc:
-                if exc.status_code == 422:
-                    self._reject(order, exc.detail)
-                    self._fail_close_target(session, parent, target, exc.reason_code, exc.detail)
+            if external_error is not None:
+                if isinstance(external_error, MarketRuleError) and external_error.status_code == 422:
+                    self._reject(order, external_error.detail)
+                    self._fail_close_target(session, parent, target, external_error.reason_code, external_error.detail)
                 else:
-                    self._defer(order, exc.detail)
-                    self._after_close_child(session, order, parent, target, None, exc.reason_code)
+                    reason = external_error.detail if isinstance(external_error, MarketRuleError) else f"{external_stage} is unavailable"
+                    reason_code = external_error.reason_code if isinstance(external_error, MarketRuleError) else (
+                        "instrument_data_unavailable" if external_stage == "instrument metadata"
+                        else "mark_price_unavailable" if external_stage == "Mark Price"
+                        else "order_book_unavailable"
+                    )
+                    LOGGER.warning("%s: order_id=%s error=%s", reason, order.id, external_error)
+                    self._defer(order, reason)
+                    self._after_close_child(session, order, parent, target, instrument, reason_code)
                 session.commit()
                 return
-            except Exception:
-                LOGGER.warning(
-                    "instrument metadata unavailable: order_id=%s exchange=%s symbol=%s",
-                    order.id,
-                    order.exchange_id,
-                    order.symbol,
-                    exc_info=True,
-                )
+            if instrument is None:
                 self._defer(order, "instrument metadata is unavailable")
                 self._after_close_child(session, order, parent, target, None, "instrument_data_unavailable")
                 session.commit()
@@ -156,7 +184,10 @@ class PaperExecutor:
                 side=order.side, quantity=remaining,
             )
             if not market_decision.allowed:
-                if order.close_request_id is not None and market_decision.reason and market_decision.reason.startswith("reduce-only"):
+                if market_decision.temporary:
+                    self._defer(order, market_decision.reason or "instrument metadata is unavailable")
+                    self._after_close_child(session, order, parent, target, instrument, market_decision.reason_code)
+                elif order.close_request_id is not None and market_decision.reason and market_decision.reason.startswith("reduce-only"):
                     order.status = "canceled"
                     order.rejection_reason = "position changed before child execution"
                     self._after_close_child(session, order, parent, target, instrument)
@@ -174,16 +205,11 @@ class PaperExecutor:
                 return
 
             mark_only = order.exchange_id == "bybit" and instrument.get("status") != "active" and order.reduce_only and order.order_type == "market"
-            mark_price = None
-            mark_observed_at = None
-            if order.exchange_id == "bybit":
-                try:
-                    mark_price, mark_observed_at = fresh_mark_price(adapter, order.symbol)
-                except MarketRuleError as exc:
-                    self._defer(order, exc.detail)
-                    self._after_close_child(session, order, parent, target, instrument, exc.reason_code)
-                    session.commit()
-                    return
+            if order.exchange_id == "bybit" and (mark_only or order.close_request_id is None) and mark_price is None:
+                self._defer(order, "fresh Mark Price is unavailable")
+                self._after_close_child(session, order, parent, target, instrument, "mark_price_unavailable")
+                session.commit()
+                return
             if mark_only:
                 decision = evaluate_order(
                     session, order, mark_price, self.config, exchange_config,
@@ -197,16 +223,7 @@ class PaperExecutor:
                     self._after_close_child(session, order, parent, target, instrument)
                 session.commit()
                 return
-            try:
-                book = adapter.fetch_order_book(order.symbol)
-            except Exception:
-                LOGGER.warning(
-                    "market data unavailable: order_id=%s exchange=%s symbol=%s",
-                    order.id,
-                    order.exchange_id,
-                    order.symbol,
-                    exc_info=True,
-                )
+            if book is None:
                 self._defer(order, "market data is unavailable")
                 self._after_close_child(session, order, parent, target, instrument)
                 session.commit()
@@ -227,12 +244,12 @@ class PaperExecutor:
                 session.commit()
                 return
             book_id = str(book.get("_market_data_id") or "")
-            if target is not None and book_id and any(
-                item.close_sequence < order.close_sequence
-                and item.last_market_data_id == book_id
-                and Decimal(item.filled_quantity) > 0
-                for item in children(session, target.id)
-            ):
+            if target is not None and book_id and session.scalar(select(Order.id).where(
+                Order.close_position_id == target.id,
+                Order.close_sequence < order.close_sequence,
+                Order.last_market_data_id == book_id,
+                Order.filled_quantity > 0,
+            ).limit(1)) is not None:
                 self._defer(order, "waiting for a new order book snapshot")
                 self._after_close_child(session, order, parent, target, instrument)
                 session.commit()
@@ -276,9 +293,10 @@ class PaperExecutor:
         target.status = "failed"
         target.reason_code = reason_code
         target.detail = detail
-        for child in children(session, target.id):
-            if child.status not in TERMINAL_ORDER_STATUSES:
-                child.cancellation_requested = True
+        session.execute(update(Order).where(
+            Order.close_position_id == target.id,
+            Order.status.not_in(TERMINAL_ORDER_STATUSES),
+        ).values(cancellation_requested=True))
         refresh_parent(session, parent)
 
     def _after_close_child(self, session, order, parent, target, instrument, wait_reason_code=None):
@@ -298,12 +316,20 @@ class PaperExecutor:
             if remaining and remaining * Decimal(target.initial_position_quantity) < 0:
                 self._fail_close_target(session, parent, target, "position_reversed", "position direction changed")
                 return
-            active = [item for item in children(session, target.id) if item.status not in TERMINAL_ORDER_STATUSES and not item.cancellation_requested]
             if remaining == 0:
-                for child in active:
-                    child.cancellation_requested = True
+                session.execute(update(Order).where(
+                    Order.close_position_id == target.id,
+                    Order.status.not_in(TERMINAL_ORDER_STATUSES),
+                    Order.cancellation_requested.is_(False),
+                ).values(cancellation_requested=True))
             elif instrument is not None:
-                scheduled = sum((Decimal(item.quantity) - Decimal(item.filled_quantity) for item in active), Decimal("0"))
+                scheduled = Decimal(session.scalar(select(func.coalesce(
+                    func.sum(Order.quantity - Order.filled_quantity), 0,
+                )).where(
+                    Order.close_position_id == target.id,
+                    Order.status.not_in(TERMINAL_ORDER_STATUSES),
+                    Order.cancellation_requested.is_(False),
+                )) or 0)
                 needed = abs(remaining) - scheduled
                 if needed > 0:
                     cap = needed
@@ -315,11 +341,15 @@ class PaperExecutor:
                         chunk = min(needed, cap)
                         append_child(session, parent, target, quantity=chunk, network=self.config.exchange_network)
                         needed -= chunk
+                        if parent.generation_mode == "incremental":
+                            break
                 refresh_target(session, target)
         refresh_parent(session, parent)
 
     def _paper_execute_mark(self, session, order, price, observed_at, exchange_config):
         remaining = Decimal(order.quantity) - Decimal(order.filled_quantity)
+        if not self._allow_fill_notional(session, order, remaining * price):
+            return
         identity = hashlib.sha256(f"{order.symbol}:{price}:{observed_at.isoformat()}".encode()).hexdigest()
         record_fill(
             session, order, quantity=remaining, price=price,
@@ -399,6 +429,8 @@ class PaperExecutor:
             else:
                 self._defer(order, "insufficient market liquidity")
             return
+        if not self._allow_fill_notional(session, order, result.notional):
+            return
         record_fill(
             session,
             order,
@@ -417,6 +449,25 @@ class PaperExecutor:
         else:
             order.status = "canceled"
             order.rejection_reason = "market order partially filled; unfilled quantity canceled"
+
+    def _allow_fill_notional(self, session: Session, order: Order, proposed_notional: Decimal) -> bool:
+        control = session.get(ControlFlag, 1)
+        if order.close_request_id is not None or (control is not None and control.close_only and order.reduce_only):
+            return True
+        prior_notional = sum(
+            (Decimal(quantity) * Decimal(price) for quantity, price in session.execute(
+                select(Fill.quantity, Fill.price).where(Fill.order_id == order.id)
+            )),
+            Decimal("0"),
+        )
+        if prior_notional + proposed_notional <= self.config.max_order_notional:
+            return True
+        if Decimal(order.filled_quantity) > 0:
+            order.status = "canceled"
+            order.rejection_reason = "maximum cumulative order notional exceeded; remaining quantity canceled"
+        else:
+            self._reject(order, "maximum cumulative order notional exceeded")
+        return False
 
     @staticmethod
     def _reject(order: Order, reason: str):

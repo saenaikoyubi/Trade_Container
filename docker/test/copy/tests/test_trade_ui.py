@@ -4,6 +4,14 @@ import httpx
 from fastapi.testclient import TestClient
 
 
+def login(client, monkeypatch, ui):
+    monkeypatch.setattr(ui, "_ui_password", lambda: "test-ui-password")
+    monkeypatch.setattr(ui, "_session_secret", lambda: b"test-session-secret")
+    result = client.post("/auth/login", json={"password": "test-ui-password"})
+    assert result.status_code == 200
+    return {"X-CSRF-Token": result.json()["csrf_token"]}
+
+
 def test_ui_serves_dashboard_and_only_proxies_allowed_gets(monkeypatch):
     import trade_ui_service.main as ui
 
@@ -25,10 +33,13 @@ def test_ui_serves_dashboard_and_only_proxies_allowed_gets(monkeypatch):
     )
 
     with TestClient(ui.app) as client:
+        assert "login-form" in client.get("/").text
+        assert client.get("/ui-api/history/orders").status_code == 401
+        csrf = login(client, monkeypatch, ui)
         page = client.get("/")
         history = client.get("/ui-api/history/orders?ignored=value")
         current = client.get("/ui-api/current-positions?exchange_id=binance&symbol=BTC%2FUSDT&ignored=value")
-        mutation = client.post("/ui-api/history/orders", json={})
+        mutation = client.post("/ui-api/history/orders", json={}, headers=csrf)
 
     assert page.status_code == 200
     assert "Trade Ledger" in page.text
@@ -49,6 +60,7 @@ def test_ui_rejects_invalid_order_id_without_calling_upstream(monkeypatch):
 
     monkeypatch.setattr(ui, "_proxy_get", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError()))
     with TestClient(ui.app) as client:
+        login(client, monkeypatch, ui)
         response = client.get("/ui-api/orders/bad$id/fills")
     assert response.status_code == 422
 
@@ -63,7 +75,7 @@ def test_ui_only_proxies_valid_trading_mutations(monkeypatch):
         assert request.headers["Authorization"] == "Bearer server-only-token"
         if request.url.path.endswith("/cancel"):
             return httpx.Response(202, json={"id": "order-1"})
-        if request.url.path == "/api/v1/positions/close":
+        if request.url.path == "/api/v2/positions/close":
             return httpx.Response(202, json={"items": []})
         if request.url.path == "/api/v1/close-only":
             return httpx.Response(
@@ -96,7 +108,8 @@ def test_ui_only_proxies_valid_trading_mutations(monkeypatch):
         "reduce_only": False,
     }
     with TestClient(ui.app) as client:
-        created = client.post("/ui-api/orders", json=order)
+        csrf = login(client, monkeypatch, ui)
+        created = client.post("/ui-api/orders", json=order, headers=csrf)
         closed = client.post(
             "/ui-api/positions/close",
             json={
@@ -104,18 +117,20 @@ def test_ui_only_proxies_valid_trading_mutations(monkeypatch):
                 "exchange_id": "binance",
                 "symbol": "BTC/USDT",
             },
+            headers=csrf,
         )
         controlled = client.post(
             "/ui-api/close-only",
             json={"enabled": True, "reason": "test"},
+            headers=csrf,
         )
-        canceled = client.post("/ui-api/orders/order-1/cancel")
+        canceled = client.post("/ui-api/orders/order-1/cancel", headers=csrf)
         invalid_origin = client.post(
             "/ui-api/orders",
             json=order,
-            headers={"Origin": "https://example.invalid"},
+            headers={**csrf, "Origin": "https://example.invalid"},
         )
-        invalid_order = client.post("/ui-api/orders/bad$id/cancel")
+        invalid_order = client.post("/ui-api/orders/bad$id/cancel", headers=csrf)
 
     assert created.status_code == 202
     assert closed.status_code == 202
@@ -125,7 +140,7 @@ def test_ui_only_proxies_valid_trading_mutations(monkeypatch):
     assert invalid_order.status_code == 422
     assert [request.url.path for request in seen] == [
         "/api/v1/orders",
-        "/api/v1/positions/close",
+        "/api/v2/positions/close",
         "/api/v1/close-only",
         "/api/v1/orders/order-1/cancel",
     ]
@@ -133,10 +148,11 @@ def test_ui_only_proxies_valid_trading_mutations(monkeypatch):
     assert json.loads(seen[1].read())["strategy_id"] == "manual"
 
 
-def test_ui_contains_trading_controls_without_chart():
+def test_ui_contains_trading_controls_without_chart(monkeypatch):
     import trade_ui_service.main as ui
 
     with TestClient(ui.app) as client:
+        login(client, monkeypatch, ui)
         page = client.get("/")
 
     assert page.status_code == 200
@@ -163,17 +179,47 @@ def test_ui_proxies_close_parent_kill_switch_and_fill_page(monkeypatch):
     )
 
     with TestClient(ui.app) as client:
+        csrf = login(client, monkeypatch, ui)
         fills = client.get("/ui-api/orders/order-1/fills?cursor=next&limit=50&ignored=1")
         parent = client.get("/ui-api/close-requests/close-1")
-        cancel = client.post("/ui-api/close-requests/close-1/cancel")
-        kill = client.post("/ui-api/kill-switch", json={"enabled": True, "reason": "test"})
+        cancel = client.post("/ui-api/close-requests/close-1/cancel", headers=csrf)
+        kill = client.post("/ui-api/kill-switch", json={"enabled": True, "reason": "test"}, headers=csrf)
 
     assert all(response.status_code == 200 for response in (fills, parent, cancel, kill))
     assert [request.url.path for request in seen] == [
         "/api/v1/orders/order-1/fills",
-        "/api/v1/close-requests/close-1",
-        "/api/v1/close-requests/close-1/cancel",
+        "/api/v2/close-requests/close-1",
+        "/api/v2/close-requests/close-1/cancel",
         "/api/v1/kill-switch",
     ]
     assert dict(seen[0].url.params) == {"cursor": "next", "limit": "50"}
     assert json.loads(seen[3].read()) == {"enabled": True, "reason": "test"}
+
+
+def test_ui_login_csrf_logout_and_request_id_lookup(monkeypatch):
+    import trade_ui_service.main as ui
+
+    seen = []
+    real_async_client = httpx.AsyncClient
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"request_id": "order-1"})
+
+    monkeypatch.setattr(ui, "_api_token", lambda: "server-only-token")
+    monkeypatch.setattr(
+        ui.httpx, "AsyncClient",
+        lambda **kwargs: real_async_client(transport=httpx.MockTransport(handler), timeout=kwargs.get("timeout")),
+    )
+    monkeypatch.setattr(ui, "_ui_password", lambda: "test-ui-password")
+    monkeypatch.setattr(ui, "_session_secret", lambda: b"test-session-secret")
+    with TestClient(ui.app) as client:
+        assert client.post("/auth/login", json={"password": "wrong"}).status_code == 401
+        csrf = login(client, monkeypatch, ui)
+        assert client.post("/ui-api/kill-switch", json={"enabled": True}).status_code == 403
+        assert client.get("/ui-api/orders/by-request-id/order-1").json()["request_id"] == "order-1"
+        assert client.post("/auth/logout").status_code == 403
+        assert client.post("/auth/logout", headers=csrf).status_code == 200
+        assert client.get("/ui-api/orders/by-request-id/order-1").status_code == 401
+    assert len(seen) == 1
+    assert seen[0].url.path == "/api/v1/orders/by-request-id/order-1"

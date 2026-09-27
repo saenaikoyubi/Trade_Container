@@ -34,6 +34,22 @@ x-api-secret: &api-secret
   bind:
     create_host_path: false
 
+x-ui-password-secret: &ui-password-secret
+  type: bind
+  source: "${TRADE_SECRETS_DIR:?TRADE_SECRETS_DIR must be set}/local/trade-ui/ui_password"
+  target: /run/ui-secrets/ui_password
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-ui-session-secret: &ui-session-secret
+  type: bind
+  source: "${TRADE_SECRETS_DIR:?TRADE_SECRETS_DIR must be set}/local/trade-ui/ui_session_secret"
+  target: /run/ui-secrets/ui_session_secret
+  read_only: true
+  bind:
+    create_host_path: false
+
 services:
   postgres:
     build:
@@ -111,13 +127,17 @@ services:
     environment:
       TRADE_API_BASE_URL: http://trade-api:8000
       API_TOKEN_FILE: /run/api-secrets/api_token
+      UI_PASSWORD_FILE: /run/ui-secrets/ui_password
+      UI_SESSION_SECRET_FILE: /run/ui-secrets/ui_session_secret
     volumes:
       - *api-secret
+      - *ui-password-secret
+      - *ui-session-secret
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
       trade-api:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
       interval: 10s
@@ -218,7 +238,56 @@ services:
       dockerfile: test/Dockerfile
     environment:
       PYTHONPATH: /app
+      TEST_POSTGRES_DSN: postgresql+psycopg://trade_test:trade_test@postgres-test:5432/trade_test
+      TEST_POSTGRES_RESTORE_HOST: postgres-restore
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+      postgres-test-restore:
+        condition: service_healthy
     restart: "no"
+    networks:
+      - test-backend
+
+  postgres-test:
+    profiles: ["tools"]
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: trade_test
+      POSTGRES_USER: trade_test
+      POSTGRES_PASSWORD: trade_test
+      PGDATA: /var/lib/postgresql/data/pgdata
+    tmpfs:
+      - /var/lib/postgresql/data:size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trade_test -d trade_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: "no"
+    networks:
+      - test-backend
+
+  postgres-test-restore:
+    profiles: ["tools"]
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: trade_restore
+      POSTGRES_USER: trade_test
+      POSTGRES_PASSWORD: trade_test
+      PGDATA: /var/lib/postgresql/data/pgdata
+    tmpfs:
+      - /var/lib/postgresql/data:size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trade_test -d trade_restore"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: "no"
+    networks:
+      test-backend:
+        aliases:
+          - postgres-restore
 
 networks:
   backend:
@@ -226,4 +295,6 @@ networks:
   api:
   exchange:
   restore-backend:
+    internal: true
+  test-backend:
     internal: true
