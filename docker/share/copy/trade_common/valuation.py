@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import Settings
+from .market_rules import fresh_mark_price, positive_decimal
 from .models import DailyPnl, Fill, Position
 
 
@@ -126,26 +127,30 @@ def calculate_account_balance(session: Session, config: Settings, adapter_pool) 
     for exchange_id, exchange_positions in grouped.items():
         try:
             adapter = adapter_pool.get(exchange_id)
-            symbols = [position.symbol for position in exchange_positions]
-            prices = adapter.fetch_prices(symbols)
-            instruments = adapter.fetch_instruments()
         except Exception as exc:
             raise ValuationError(f"market data is unavailable for {exchange_id}") from exc
-        price_by_symbol = {item["symbol"]: item for item in prices}
-        instrument_by_symbol = {item["symbol"]: item for item in instruments}
         for position in exchange_positions:
-            instrument = instrument_by_symbol.get(position.symbol)
+            try:
+                instrument = adapter.fetch_instruments(position.symbol)[0]
+            except Exception as exc:
+                raise ValuationError(f"instrument metadata is unavailable for {exchange_id} {position.symbol}") from exc
             settle_asset = str(
-                (instrument or {}).get("settle_asset")
-                or (instrument or {}).get("quote_asset")
+                instrument.get("settle_asset")
+                or (instrument.get("quote_asset") if exchange_id != "bybit" else None)
                 or ""
             )
             if settle_asset not in allowed_stablecoins:
                 raise ValuationError(
                     f"unsupported settlement currency for {exchange_id} {position.symbol}: {settle_asset or 'unknown'}"
                 )
-            price_item = price_by_symbol.get(position.symbol)
-            price = Decimal(price_item["mid_price"]) if price_item and price_item.get("mid_price") is not None else None
+            try:
+                if exchange_id == "bybit":
+                    price, _ = fresh_mark_price(adapter, position.symbol)
+                else:
+                    price_item = adapter.fetch_prices([position.symbol])[0]
+                    price = positive_decimal(price_item.get("mid_price"))
+            except Exception as exc:
+                raise ValuationError(f"market price is unavailable for {exchange_id} {position.symbol}") from exc
             if price is None or not price.is_finite() or price <= 0:
                 raise ValuationError(f"market price is unavailable for {exchange_id} {position.symbol}")
             quantity = Decimal(position.quantity)

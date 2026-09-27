@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -40,6 +41,13 @@ class FakeMarketAdapter:
 
     def market(self, symbol):
         return {"base": symbol.split("/")[0], "quote": symbol.split("/")[1]}
+
+    def fetch_instruments(self, symbol=None):
+        return [{
+            "base_asset": symbol.split("/")[0],
+            "quote_asset": symbol.split("/")[1],
+            "settle_asset": "USD",
+        }]
 
     def fetch_order_book(self, symbol):
         if symbol in self.fail_symbols:
@@ -131,7 +139,7 @@ def test_current_positions_values_long_and_short_without_writing_database(sessio
     client, api = api_client
     seed_positions(sessions)
     adapter = FakeMarketAdapter()
-    monkeypatch.setattr(api, "_public_exchange", lambda _config: adapter)
+    monkeypatch.setattr(api, "_runtime_pool", lambda _config: SimpleNamespace(get=lambda _id: adapter))
 
     response = client.get("/api/v1/current-positions?exchange_id=fake")
 
@@ -157,7 +165,7 @@ def test_current_positions_marks_partial_failure_and_omits_total(sessions, api_c
     client, api = api_client
     seed_positions(sessions)
     adapter = FakeMarketAdapter(fail_symbols={"ETH/USD"})
-    monkeypatch.setattr(api, "_public_exchange", lambda _config: adapter)
+    monkeypatch.setattr(api, "_runtime_pool", lambda _config: SimpleNamespace(get=lambda _id: adapter))
 
     response = client.get("/api/v1/current-positions?exchange_id=fake")
 
@@ -174,12 +182,13 @@ def test_current_positions_marks_partial_failure_and_omits_total(sessions, api_c
 
 def test_current_positions_validates_symbol_and_returns_empty_snapshot(sessions, api_client, monkeypatch):
     client, api = api_client
-    monkeypatch.setattr(api, "_public_exchange", lambda _config: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(api, "_runtime_pool", lambda _config: (_ for _ in ()).throw(AssertionError()))
 
     rejected = client.get("/api/v1/current-positions?exchange_id=fake&symbol=NOT%2FALLOWED")
     empty = client.get("/api/v1/current-positions?exchange_id=fake&symbol=BTC%2FUSD")
 
-    assert rejected.status_code == 422
+    assert rejected.status_code == 200
+    assert rejected.json()["positions"] == []
     assert empty.status_code == 200
     assert empty.json()["positions"] == []
     assert Decimal(empty.json()["total_unrealized_pnl"]) == Decimal("0")

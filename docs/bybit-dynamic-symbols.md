@@ -1,6 +1,6 @@
 # Bybit 動的銘柄対応
 
-`settings.json` に事前登録していない Bybit の USDT Linear Perpetual をPaper取引で扱うための、機能概要と受入条件です。この機能は実装前の目標仕様です。
+`settings.json` に事前登録していない Bybit の USDT Linear Perpetual をPaper取引で扱うための、機能概要と受入条件です。
 
 ## 仕様の正本
 

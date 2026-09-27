@@ -22,6 +22,9 @@ class Order(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     request_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     strategy_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    close_request_id: Mapped[str | None] = mapped_column(ForeignKey("close_requests.id"), index=True)
+    close_position_id: Mapped[str | None] = mapped_column(ForeignKey("close_request_positions.id"))
+    close_sequence: Mapped[int | None] = mapped_column(Integer)
     exchange_id: Mapped[str] = mapped_column(String(32), index=True, default="unknown", nullable=False)
     exchange_network: Mapped[str] = mapped_column(String(16), default="mainnet", nullable=False)
     symbol: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -74,6 +77,46 @@ class Position(Base):
     quantity: Mapped[Decimal] = mapped_column(Numeric(36, 18), default=Decimal("0"), nullable=False)
     average_entry_price: Mapped[Decimal] = mapped_column(Numeric(36, 18), default=Decimal("0"), nullable=False)
     realized_pnl: Mapped[Decimal] = mapped_column(Numeric(36, 18), default=Decimal("0"), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class RequestKey(Base):
+    __tablename__ = "request_keys"
+
+    request_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    operation_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(36), nullable=False)
+
+
+class CloseRequest(Base):
+    __tablename__ = "close_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    request_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    exchange_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    symbol: Mapped[str | None] = mapped_column(String(64))
+    submitted_symbol: Mapped[str | None] = mapped_column(String(64))
+    strategy_id: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), default="queued", nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64))
+    detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class CloseRequestPosition(Base):
+    __tablename__ = "close_request_positions"
+    __table_args__ = (UniqueConstraint("close_request_id", "position_id", name="uq_close_request_position"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    close_request_id: Mapped[str] = mapped_column(ForeignKey("close_requests.id"), index=True, nullable=False)
+    position_id: Mapped[str] = mapped_column(ForeignKey("positions.id"), index=True, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    initial_position_quantity: Mapped[Decimal] = mapped_column(Numeric(36, 18), nullable=False)
+    remaining_position_quantity: Mapped[Decimal] = mapped_column(Numeric(36, 18), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="queued", nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64))
+    detail: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
 

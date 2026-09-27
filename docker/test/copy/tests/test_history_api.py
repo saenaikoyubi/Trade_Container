@@ -245,12 +245,6 @@ def test_history_unknown_symbols_return_empty_pages(client):
 def test_history_uses_cached_alias_and_keeps_canonical_scoped_to_exchange(sessions, client):
     import trade_api_service.main as api
 
-    class CachedAdapter:
-        @staticmethod
-        def resolve_cached_symbol(symbol):
-            return "BTCUSDT" if symbol == "BTC/USDT:USDT" else None
-
-    api.app.state.adapter_pool._adapters["active"] = CachedAdapter()
     created_at = datetime(2026, 7, 4, 12, tzinfo=timezone.utc)
     with sessions() as session:
         session.add_all(
@@ -258,7 +252,7 @@ def test_history_uses_cached_alias_and_keeps_canonical_scoped_to_exchange(sessio
                 Order(
                     id="active-canonical",
                     request_id="active-canonical",
-                    exchange_id="active",
+                    exchange_id="bybit",
                     exchange_network="mainnet",
                     symbol="BTCUSDT",
                     side="buy",
@@ -270,7 +264,7 @@ def test_history_uses_cached_alias_and_keeps_canonical_scoped_to_exchange(sessio
                 Order(
                     id="active-legacy",
                     request_id="active-legacy",
-                    exchange_id="active",
+                    exchange_id="bybit",
                     exchange_network="mainnet",
                     symbol="BTC/USDT:USDT",
                     side="buy",

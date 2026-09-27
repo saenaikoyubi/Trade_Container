@@ -2,7 +2,7 @@
 
 PostgreSQL のマイグレーション、バックアップ、隔離リストアの手順です。
 
-Bybit の canonical symbol と履歴照合、および全決済の親子関係について、この文書をデータ不変条件の正本とします。API 契約は [API仕様](api.md)、執行規則は [取引・執行仕様](trading-engine.md) を参照してください。設定外 Bybit 銘柄と分割全決済に関する追加スキーマ、約定時刻による日次損益計上は実装前の目標仕様です。
+Bybit の canonical symbol と履歴照合、および全決済の親子関係について、この文書をデータ不変条件の正本とします。API 契約は [API仕様](api.md)、執行規則は [取引・執行仕様](trading-engine.md) を参照してください。
 
 ## 1. スキーママイグレーション
 
@@ -22,11 +22,12 @@ docker compose --env-file .env.local -f docker/compose.yaml run --rm db-migrate
 | `002` | `002_order_retry_schedule.sql` | 注文リトライ制御用カラム（`next_attempt_at`, `retry_count`）の追加 |
 | `003` | `003_close_only.sql` | Close-only / 取引制御フラグ管理機能の拡張 |
 | `004` | `004_order_strategy_id.sql` | 注文テーブルへの監査タグ（`strategy_id`）カラム追加およびインデックス（`ix_orders_strategy_id`）作成 |
+| `005` | `005_close_requests.sql` | 共通冪等性キー、全決済親処理・対象建玉、子注文の親子参照と逐次執行用インデックス |
 
 > [!NOTE]
 > 外部市場データ（`instruments`）や仮想口座（`accounts`）のテーブル新設は見送られます。全決済の監査と冪等性に必要な親処理は永続化します。
 
-### 全決済の追加スキーマ（目標仕様）
+### 全決済の追加スキーマ
 
 - `request_keys.request_id` は通常注文・全決済子注文・全決済親処理に共通する一意キーです。操作種別と対象レコードIDを保持し、API間の同一キー利用も衝突として検出します。`orders.request_id` の一意制約は維持します。
 - `close_requests` は親の `request_id`、正規化済み入力（`exchange_id`、`symbol` の指定有無と値、`strategy_id`）、受付時刻、状態、待機・失敗理由を保持します。`symbol` の省略と明示指定は別の入力です。同一キー・同一入力の再送は市場情報を再取得せず既存の親処理を返し、異なる入力は409です。

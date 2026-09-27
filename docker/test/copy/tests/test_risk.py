@@ -98,8 +98,8 @@ def test_reduce_only_rejects_increase_and_reversal():
         session.add_all([increase, reversal])
         session.flush()
 
-        assert evaluate_order(session, increase, Decimal("500"), CONFIG, EXCHANGE).reason == "reduce-only order would increase the position"
-        assert evaluate_order(session, reversal, Decimal("500"), CONFIG, EXCHANGE).reason == "reduce-only order would reverse the position"
+        assert not evaluate_order(session, increase, Decimal("500"), CONFIG, EXCHANGE).allowed
+        assert not evaluate_order(session, reversal, Decimal("500"), CONFIG, EXCHANGE).allowed
 
 
 def test_close_only_rejects_opening_and_allows_full_reduce_beyond_normal_limits():

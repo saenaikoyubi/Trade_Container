@@ -9,12 +9,48 @@ from sqlalchemy.orm import Session
 
 from .config import ExchangeSettings, Settings
 from .models import ControlFlag, DailyPnl, Order, Position
+from .market_rules import positive_decimal
 
 
 @dataclass(frozen=True)
 class RiskDecision:
     allowed: bool
     reason: str | None = None
+    temporary: bool = False
+    reason_code: str | None = None
+
+
+def validate_instrument_market(
+    instrument: dict,
+    *,
+    exchange_id: str,
+    order_type: str,
+    reduce_only: bool,
+    position_quantity: Decimal,
+    side: str,
+    quantity: Decimal,
+) -> RiskDecision:
+    if exchange_id == "bybit" and not (
+        instrument.get("contract_type") == "linear_perpetual"
+        and instrument.get("quote_asset") == "USDT"
+        and instrument.get("settle_asset") == "USDT"
+    ):
+        return RiskDecision(False, "unsupported Bybit market", reason_code="unsupported_market")
+    signed = quantity if side == "buy" else -quantity
+    if reduce_only and (
+        position_quantity == 0
+        or position_quantity * signed >= 0
+        or quantity > abs(position_quantity)
+    ):
+        return RiskDecision(False, "reduce-only order would increase or reverse the position")
+    status = str(instrument.get("status") or "unknown")
+    if exchange_id == "bybit" and status != "active":
+        if reduce_only and order_type == "market":
+            return RiskDecision(True)
+        return RiskDecision(False, "instrument is not tradable", reason_code="instrument_not_tradable")
+    if exchange_id != "bybit" and status == "inactive":
+        return RiskDecision(False, "instrument is inactive")
+    return RiskDecision(True)
 
 
 def validate_instrument_quantity(
@@ -23,39 +59,50 @@ def validate_instrument_quantity(
     instrument: dict,
     *,
     is_full_close: bool = False,
+    is_close_child: bool = False,
     order_type: str = "limit",
 ) -> RiskDecision:
-    status = str(instrument.get("status") or "unknown")
-    if status == "inactive":
-        return RiskDecision(False, "instrument is inactive")
-
+    if quantity <= 0:
+        return RiskDecision(False, "quantity must be positive")
+    invalid_fields = set(instrument.get("_invalid_fields") or ())
     max_qty = instrument.get("max_qty")
+    if "max_qty" in invalid_fields or (max_qty is not None and positive_decimal(max_qty) is None):
+        return RiskDecision(False, "max_qty is invalid", True, "instrument_metadata_invalid")
     if max_qty is not None and quantity > Decimal(max_qty):
         return RiskDecision(False, "maximum instrument quantity exceeded")
     if order_type == "market":
         max_market_qty = instrument.get("max_market_qty")
+        if instrument.get("exchange_id") == "bybit" and (
+            max_market_qty is None or positive_decimal(max_market_qty) is None
+            or "max_market_qty" in invalid_fields
+        ):
+            return RiskDecision(False, "max_market_qty is missing or invalid", True, "instrument_metadata_invalid")
+        if max_market_qty is not None and positive_decimal(max_market_qty) is None:
+            return RiskDecision(False, "max_market_qty is invalid", True, "instrument_metadata_invalid")
         if max_market_qty is not None and quantity > Decimal(max_market_qty):
             return RiskDecision(False, "maximum instrument quantity exceeded")
-    if is_full_close:
+    if is_full_close or is_close_child:
         return RiskDecision(True)
 
     min_qty = instrument.get("min_qty")
     qty_step = instrument.get("qty_step")
     min_notional = instrument.get("min_notional")
+    if min_qty is None or qty_step is None or "min_qty" in invalid_fields or "qty_step" in invalid_fields:
+        return RiskDecision(False, "instrument metadata is incomplete", True, "instrument_metadata_invalid")
+    min_qty = positive_decimal(min_qty)
+    qty_step = positive_decimal(qty_step)
     if min_qty is None or qty_step is None:
-        return RiskDecision(False, "instrument metadata is incomplete")
-    min_qty = Decimal(min_qty)
-    qty_step = Decimal(qty_step)
-    if min_qty <= 0 or qty_step <= 0:
-        return RiskDecision(False, "instrument metadata is invalid")
+        return RiskDecision(False, "instrument metadata is invalid", True, "instrument_metadata_invalid")
     if min_notional is not None:
-        min_notional = Decimal(min_notional)
-        if min_notional <= 0:
-            return RiskDecision(False, "instrument metadata is invalid")
+        min_notional = positive_decimal(min_notional)
+    if "min_notional" in invalid_fields or (instrument.get("min_notional") is not None and min_notional is None):
+        return RiskDecision(False, "min_notional is invalid", True, "instrument_metadata_invalid")
     if quantity < min_qty:
         return RiskDecision(False, "minimum instrument quantity not met")
     if (quantity - min_qty) % qty_step != 0:
         return RiskDecision(False, "instrument quantity step is not aligned")
+    if min_notional is not None and price is None:
+        return RiskDecision(False, "market price is unavailable", True, "order_book_unavailable")
     if min_notional is not None and price is not None and quantity * price < min_notional:
         return RiskDecision(False, "minimum instrument notional not met")
     return RiskDecision(True)
@@ -70,10 +117,11 @@ def evaluate_order(
     instrument: dict | None = None,
     *,
     execution_price: Decimal | None = None,
+    valuation_price: Decimal | None = None,
 ) -> RiskDecision:
     if order.exchange_id != exchange_config.exchange_id:
         return RiskDecision(False, "order exchange does not match exchange configuration")
-    if order.symbol not in exchange_config.symbols:
+    if order.exchange_id != "bybit" and order.symbol not in exchange_config.symbols:
         return RiskDecision(False, "symbol is not allowed")
     if order.quantity <= 0:
         return RiskDecision(False, "quantity must be positive")
@@ -105,11 +153,19 @@ def evaluate_order(
     )
     current_quantity = position.quantity if position else Decimal("0")
     signed_order = remaining_quantity if order.side == "buy" else -remaining_quantity
-    if order.reduce_only:
-        if current_quantity == 0 or current_quantity * signed_order > 0:
-            return RiskDecision(False, "reduce-only order would increase the position")
-        if abs(signed_order) > abs(current_quantity):
-            return RiskDecision(False, "reduce-only order would reverse the position")
+    if order.reduce_only and (
+        current_quantity == 0 or current_quantity * signed_order >= 0
+        or remaining_quantity > abs(Decimal(current_quantity))
+    ):
+        return RiskDecision(False, "reduce-only order would increase or reverse the position")
+    if instrument is not None:
+        market_decision = validate_instrument_market(
+            instrument, exchange_id=order.exchange_id, order_type=order.order_type,
+            reduce_only=order.reduce_only, position_quantity=Decimal(current_quantity),
+            side=order.side, quantity=remaining_quantity,
+        )
+        if not market_decision.allowed:
+            return market_decision
 
     is_full_close = bool(order.reduce_only and remaining_quantity == abs(Decimal(current_quantity)))
     if instrument is not None:
@@ -118,12 +174,13 @@ def evaluate_order(
             price,
             instrument,
             is_full_close=is_full_close,
+            is_close_child=order.close_request_id is not None,
             order_type=order.order_type,
         )
         if not instrument_decision.allowed:
             return instrument_decision
 
-    protected_close = close_only and order.reduce_only
+    protected_close = (close_only and order.reduce_only) or order.close_request_id is not None
     if not protected_close:
         if order.quantity > config.max_order_quantity:
             return RiskDecision(False, "maximum order quantity exceeded")
@@ -134,7 +191,7 @@ def evaluate_order(
         if recent_count > config.max_orders_per_minute:
             return RiskDecision(False, "order rate limit exceeded")
 
-    projected_notional = abs(current_quantity + signed_order) * mid_price
+    projected_notional = abs(current_quantity + signed_order) * (valuation_price or mid_price)
     if not protected_close and projected_notional > config.max_position_notional:
         return RiskDecision(False, "maximum position notional exceeded")
 

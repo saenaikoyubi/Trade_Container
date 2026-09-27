@@ -205,8 +205,8 @@ def test_order_api_validates_exchange_symbol_and_idempotency(sessions, monkeypat
         "ExchangeAdapterPool",
         lambda config: FakePool(
             {
-                "binance": FakeAdapter(order_book("api-binance"), allowed_symbols={"BTC/USDT"}),
-                "dydx": FakeAdapter(order_book("api-dydx"), allowed_symbols={"BTC-USD"}),
+                "binance": FakeAdapter({**order_book("api-binance"), "_received_at": datetime.now(timezone.utc)}, allowed_symbols={"BTC/USDT"}),
+                "dydx": FakeAdapter({**order_book("api-dydx"), "_received_at": datetime.now(timezone.utc)}, allowed_symbols={"BTC-USD"}),
             },
             config,
         ),

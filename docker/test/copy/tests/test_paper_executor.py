@@ -8,7 +8,8 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from trade_common.config import ExchangeSettings, Settings
-from trade_common.models import Base, Fill, Order, Position
+from trade_common.close_service import append_child
+from trade_common.models import Base, CloseRequest, CloseRequestPosition, Fill, Order, Position
 from trade_common.runner import PaperExecutor
 
 
@@ -329,6 +330,48 @@ def test_missing_instrument_metadata_surface_is_deferred(sessions):
         assert order.next_attempt_at.replace(tzinfo=timezone.utc) > NOW
 
 
+def test_split_close_waits_for_new_order_book_snapshot(sessions):
+    with sessions() as session:
+        position = Position(
+            exchange_id="fake", symbol="BTC/USD",
+            quantity=Decimal("2"), average_entry_price=Decimal("100"),
+        )
+        parent = CloseRequest(request_id="snapshot-close", exchange_id="fake", status="queued")
+        session.add_all([position, parent])
+        session.flush()
+        target = CloseRequestPosition(
+            close_request_id=parent.id, position_id=position.id, symbol="BTC/USD",
+            initial_position_quantity=Decimal("2"),
+            remaining_position_quantity=Decimal("2"), status="queued",
+        )
+        session.add(target)
+        session.flush()
+        first = append_child(session, parent, target, quantity=Decimal("1"), network="mainnet")
+        second = append_child(session, parent, target, quantity=Decimal("1"), network="mainnet")
+        first.next_attempt_at = second.next_attempt_at = NOW
+        session.commit()
+        parent_id, position_id, second_id = parent.id, position.id, second.id
+
+    worker = executor(sessions, FakeExchange(
+        book("same-snapshot", bids=[["100", "1"]]),
+        book("same-snapshot", bids=[["100", "1"]]),
+        book("new-snapshot", bids=[["100", "1"]]),
+    ))
+    assert worker.process_once() is True
+    assert worker.process_once() is True
+    with sessions() as session:
+        assert session.get(Position, position_id).quantity == Decimal("1")
+        assert session.get(Order, second_id).status == "pending"
+        assert session.get(CloseRequest, parent_id).status == "waiting"
+        session.get(Order, second_id).next_attempt_at = NOW
+        session.commit()
+
+    assert worker.process_once() is True
+    with sessions() as session:
+        assert session.get(Position, position_id).quantity == Decimal("0")
+        assert session.get(CloseRequest, parent_id).status == "completed"
+
+
 def test_empty_instrument_metadata_is_deferred(sessions):
     order_id = add_order(sessions)
     worker = executor(sessions, MetadataSequenceExchange([[]]))
@@ -384,14 +427,14 @@ def test_partial_fill_state_survives_instrument_metadata_failure(sessions):
 
 
 @pytest.mark.parametrize(
-    ("metadata", "reason"),
+    ("metadata", "reason", "expected_status"),
     [
-        ({**instrument_metadata(), "min_qty": None}, "instrument metadata is incomplete"),
-        ({**instrument_metadata(), "qty_step": None}, "instrument metadata is incomplete"),
-        (instrument_metadata(status="inactive"), "instrument is inactive"),
+        ({**instrument_metadata(), "min_qty": None}, "instrument metadata is incomplete", "pending"),
+        ({**instrument_metadata(), "qty_step": None}, "instrument metadata is incomplete", "pending"),
+        (instrument_metadata(status="inactive"), "instrument is inactive", "rejected"),
     ],
 )
-def test_structurally_invalid_instrument_metadata_is_rejected(sessions, metadata, reason):
+def test_structurally_invalid_instrument_metadata_is_handled(sessions, metadata, reason, expected_status):
     order_id = add_order(sessions)
     worker = executor(
         sessions,
@@ -402,7 +445,7 @@ def test_structurally_invalid_instrument_metadata_is_rejected(sessions, metadata
 
     with sessions() as session:
         order = session.get(Order, order_id)
-        assert order.status == "rejected"
+        assert order.status == expected_status
         assert order.rejection_reason == reason
 
 
@@ -439,7 +482,9 @@ def test_api_to_executor_to_query_flow(sessions, monkeypatch):
     monkeypatch.setattr(
         api,
         "ExchangeAdapterPool",
-        lambda config: FakeAdapterPool({"fake": FakeExchange()}, config),
+        lambda config: FakeAdapterPool({"fake": FakeExchange(book(
+            "api-preflight", received_at=datetime.now(timezone.utc)
+        ))}, config),
     )
     try:
         with TestClient(api.app) as client:
@@ -484,7 +529,7 @@ def test_api_to_executor_to_query_flow(sessions, monkeypatch):
 
         assert order_response.json()["status"] == "filled"
         assert "mode" not in order_response.json()
-        assert fills_response.json()[0]["liquidity_role"] == "taker"
+        assert fills_response.json()["items"][0]["liquidity_role"] == "taker"
         assert positions_response.json()[0]["quantity"] == "1.000000000000000000"
     finally:
         api.app.dependency_overrides.clear()

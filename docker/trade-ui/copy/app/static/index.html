@@ -33,6 +33,7 @@
               <input id="control-reason" type="text" maxlength="500" placeholder="テスト停止、緊急決済など">
             </label>
             <button id="close-only-toggle" class="warning-button" type="button">Close-onlyを有効化</button>
+            <button id="kill-switch-toggle" class="danger-button" type="button">Kill Switchを有効化</button>
           </div>
         </div>
         <p id="control-message" class="operation-message" role="status"></p>
@@ -46,9 +47,8 @@
           </label>
           <label>
             <span>銘柄</span>
-            <select id="order-symbol" required disabled>
-              <option value="">取引所を先に選択</option>
-            </select>
+            <input id="order-symbol" list="order-symbol-options" type="text" maxlength="64" placeholder="取引所を先に選択" autocomplete="off" required disabled>
+            <datalist id="order-symbol-options"></datalist>
           </label>
           <label>
             <span>売買</span>
@@ -166,7 +166,11 @@
         </div>
         <div class="current-meta">
           <span id="current-updated">「現在値を更新」を押すと市場価格を取得します</span>
-          <span>建玉は保存済みデータ、現在価格は注文板の中間価格</span>
+          <span>建玉は保存済みデータ、Bybitの現在価格はMark Price</span>
+        </div>
+        <div id="close-request-panel" class="operation-message" role="status" hidden>
+          <span id="close-request-status"></span>
+          <button id="close-request-cancel" class="danger-button" type="button" hidden>全決済を取り消す</button>
         </div>
         <div id="current-error" class="current-error" role="alert" hidden></div>
         <div class="table-scroll current-table-scroll">
@@ -245,6 +249,7 @@
       <div class="dialog-section">
         <h3>関連約定</h3>
         <div id="order-fills" class="related-fills"></div>
+        <div class="load-more"><button id="order-fills-more" type="button" hidden>関連約定をさらに読み込む</button></div>
       </div>
     </dialog>
   </body>

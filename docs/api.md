@@ -2,7 +2,7 @@
 
 `trade-api` は HTTP REST API を提供します。`/health`, `/ready` 以外の全エンドポイントで `Authorization: Bearer <token>` が必須です。
 
-この文書はAPI入力・応答・エラーの**将来の目標仕様**の正本です。既存エンドポイントの詳細化と契約変更、Bybit設定外銘柄、分割全決済、Kill Switchによる受付停止・取消を含みます。現行コードの振る舞いを併記しません。実装時にはBot・trade-ui・テストを同じ契約へ移行します。Bybit機能の概要・受入条件は [Bybit 動的銘柄対応](bybit-dynamic-symbols.md) を参照してください。
+この文書はAPI入力・応答・エラーの正本です。Bybit設定外銘柄、分割全決済、Kill Switchによる受付停止・取消を含みます。Bybit機能の概要・受入条件は [Bybit 動的銘柄対応](bybit-dynamic-symbols.md) を参照してください。
 
 ## エンドポイント一覧
 
@@ -279,7 +279,7 @@ Bybit の銘柄関連エラーはトップレベルの文字列`detail`（説明
 
 期限切れmetadataは返しません。Bybit が認識する対象市場なら`inactive`/`unknown`や`null`の制約値も`200 OK`で返します。`new_or_increase_allowed`は状態が`active`で、すべての注文種別に共通する必須制約が正常な場合だけ`true`です。`false`の理由は`new_or_increase_reason_code`で返します。これは市場metadataから分かる基本的な適格性であり、Market固有の`max_market_qty`、注文板・Mark Priceの取得、個別リスク検査の成功まで保証しません。未知銘柄・対象外市場は422、metadata取得失敗は503です。
 
-`inactive`/`unknown`なら`new_or_increase_reason_code=instrument_not_tradable`、取引状態が`active`で検査に必要な`min_qty`・`qty_step`または定義済み`min_notional`が不正なら`instrument_metadata_invalid`です。状態と制約の両方に問題がある場合は状態の理由を優先します。いずれも新規・増加の基本的な適格性だけを示し、保有建玉のReduce-only全決済可否は別途判定します。
+`inactive`/`unknown`なら`new_or_increase_reason_code=instrument_not_tradable`、取引状態が`active`で検査に必要な`min_qty`・`qty_step`または定義済み`min_notional`・`max_qty`が不正なら`instrument_metadata_invalid`です。状態と制約の両方に問題がある場合は状態の理由を優先します。いずれも新規・増加の基本的な適格性だけを示し、保有建玉のReduce-only全決済可否は別途判定します。
 
 - **Path**: `GET /api/v1/instruments`
 - **Query Parameters**:
@@ -569,6 +569,7 @@ DBに保存された建玉行を返します。数量ゼロになった行も、
 - 親に属する**すべて**の子注文は`min_qty`、`qty_step`、`min_notional`を値の欠落・不正時も含めて免除します。内部の`max_order_quantity`、`max_order_notional`、注文頻度、`max_position_notional`、日次損失上限も免除します。市場の`max_market_qty`と定義済み`max_qty`、正の数量、対象市場判定、Reduce-onlyの反転禁止、必要データの鮮度は免除しません。
 - 初期子注文を受付時に全件作成し、同じ建玉では子順序で逐次執行します。部分約定で残りが取り消された場合は実際の建玉を再計算し、同じ親に追加子注文を作ります。受付済み子注文の数量は変更しません。流動性や一時的な市場情報が不足した場合、固定回数で終了せず、指数バックオフで待機します。
 - Bybitの`inactive`/`unknown`対象市場で既存建玉を閉じるときは、新しいMark Priceを取得できれば板がなくてもPaper成行決済します。受付時に必要なMark Priceを取得できなければ503です。受付後の取得失敗は親を`waiting`として再試行します。対象外市場と確定した銘柄はその建玉の処理を`failed`にしますが、他銘柄の執行は続けます。
+- 受付後に取引所が設定から削除された場合、未完了の通常注文は拒否し、進行中の全決済では該当建玉の処理を`failed`にします。他銘柄の処理は続けます。
 - trade-ui経由の直接注文と全決済では、ブラウザpayloadの値にかかわらずproxyが`strategy_id: "manual"`を強制付与します。
 
 **HTTP応答**: 新規の非空処理は`202 Accepted`。初回に対象建玉がなければ子注文0件の`completed`親処理を記録して`200 OK`。同一`request_id`・同一入力の再送は市場情報を再取得せず、その時点の親処理を`200 OK`で返します。キーを他の通常注文や異なる全決済入力に使った場合は409です。

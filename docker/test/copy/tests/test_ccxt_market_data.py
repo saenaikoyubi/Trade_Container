@@ -1,10 +1,69 @@
 from decimal import Decimal
 
+import pytest
+
 from trade_common.config import ExchangeSettings
 from trade_common.exchange_adapters.ccxt_adapter import CcxtAdapter
+from trade_common.market_rules import MarketRuleError
 
 
-def test_bybit_options_select_linear_market_and_price_cache(monkeypatch):
+def test_bybit_resolves_unconfigured_linear_market_from_catalog(monkeypatch):
+    class FakeBybit:
+        def __init__(self, _params):
+            self.markets = {
+                "ETH/USDT:USDT": {
+                    "id": "ETHUSDT", "symbol": "ETH/USDT:USDT", "swap": True,
+                    "linear": True, "active": True, "base": "ETH", "quote": "USDT",
+                    "settle": "USDT", "precision": {"amount": 0.01},
+                    "limits": {"amount": {"min": 0.01}},
+                    "info": {"lotSizeFilter": {"maxMktOrderQty": "20"}},
+                },
+                "ADA/USDT": {
+                    "id": "ADAUSDT", "symbol": "ADA/USDT", "spot": True,
+                    "base": "ADA", "quote": "USDT",
+                },
+            }
+
+        def load_markets(self, *args, **kwargs):
+            return self.markets
+
+    monkeypatch.setattr("trade_common.exchange_adapters.ccxt_adapter.ccxt.bybit", FakeBybit)
+    adapter = CcxtAdapter(ExchangeSettings(
+        exchange_id="bybit", adapter="ccxt", symbols=(),
+        taker_fee_rate=Decimal("0.001"), maker_fee_rate=Decimal("0.001"),
+        options={"defaultType": "linear"},
+    ))
+
+    assert adapter.metadata_ready
+    assert adapter.fetch_instruments() == []
+    assert adapter.resolve_symbol("ETH/USDT:USDT") == "ETHUSDT"
+    assert adapter.fetch_instruments("ETHUSDT")[0]["max_market_qty"] == Decimal("20")
+    with pytest.raises(MarketRuleError) as unsupported:
+        adapter.resolve_symbol("ADAUSDT")
+    assert unsupported.value.reason_code == "unsupported_market"
+    with pytest.raises(MarketRuleError) as unknown:
+        adapter.resolve_symbol("DOGEUSDT")
+    assert unknown.value.reason_code == "unknown_symbol"
+
+
+def test_empty_bybit_catalog_does_not_report_metadata_ready(monkeypatch):
+    class EmptyBybit:
+        def __init__(self, _params):
+            self.markets = {}
+
+        def load_markets(self, *args, **kwargs):
+            return {}
+
+    monkeypatch.setattr("trade_common.exchange_adapters.ccxt_adapter.ccxt.bybit", EmptyBybit)
+    with pytest.raises(RuntimeError, match="catalog is empty"):
+        CcxtAdapter(ExchangeSettings(
+            exchange_id="bybit", adapter="ccxt", symbols=(),
+            taker_fee_rate=Decimal("0.001"), maker_fee_rate=Decimal("0.001"),
+            options={"defaultType": "linear"},
+        ))
+
+
+def test_bybit_options_select_linear_market_and_fetch_fresh_prices(monkeypatch):
     calls = {"books": 0}
 
     class FakeBybit:
@@ -73,10 +132,12 @@ def test_bybit_options_select_linear_market_and_price_cache(monkeypatch):
     assert instrument["qty_step"] == Decimal("0.001")
     assert instrument["min_notional"] == Decimal("5")
     assert instrument["quantity_unit"] == "BTC"
-    assert instrument["max_market_qty"] == Decimal("100")
+    assert instrument["max_market_qty"] is None
+    assert instrument["max_qty"] == Decimal("100")
     assert first["mid_price"] == Decimal("100")
-    assert second == first
-    assert calls["books"] == 1
+    assert first["mark_price"] == Decimal("101")
+    assert second["mid_price"] == Decimal("100")
+    assert calls["books"] == 2
 
 
 def test_bybit_instrument_metadata_fallback_lot_size_filter(monkeypatch):

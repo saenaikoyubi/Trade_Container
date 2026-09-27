@@ -56,6 +56,13 @@ class FakeAdapter:
             for symbol in (symbols or [])
         ]
 
+    def fetch_order_book(self, symbol):
+        return {
+            "bids": [["99", "10"]], "asks": [["101", "10"]],
+            "_received_at": datetime.now(timezone.utc),
+            "_request_duration_seconds": 0.01,
+        }
+
     def close(self):
         return None
 
@@ -132,10 +139,17 @@ def test_close_only_cancels_opening_orders_and_rejects_new_ones(sessions, client
     assert enabled.json()["kill_switch"] is False
     assert enabled.json()["cancellation_requested_count"] == 1
 
+    with sessions() as session:
+        session.add(Position(
+            exchange_id="fake", symbol="BTC/USD",
+            quantity=Decimal("1"), average_entry_price=Decimal("100"),
+        ))
+        session.commit()
+
     rejected = client.post("/api/v1/orders", json=order_payload("opening-after-control"))
     closing = client.post(
         "/api/v1/orders",
-        json=order_payload("closing-after-control", reduce_only=True),
+        json={**order_payload("closing-after-control", reduce_only=True), "side": "sell"},
     )
     control = client.get("/api/v1/trading-control")
 
@@ -198,7 +212,7 @@ def test_close_positions_creates_reduce_only_orders_and_is_idempotent(sessions, 
     replayed = client.post("/api/v1/positions/close", json=payload)
 
     assert created.status_code == 202
-    assert replayed.status_code == 202
+    assert replayed.status_code == 200
     created_items = created.json()["items"]
     replayed_items = replayed.json()["items"]
     assert [item["id"] for item in replayed_items] == [item["id"] for item in created_items]
@@ -246,8 +260,9 @@ def test_close_positions_supports_one_symbol_and_rejects_empty_position(sessions
 
     assert created.status_code == 202
     assert created.json()["items"][0]["side"] == "buy"
-    assert missing.status_code == 409
-    assert missing.json()["detail"] == "no open position exists"
+    assert missing.status_code == 200
+    assert missing.json()["status"] == "completed"
+    assert missing.json()["items"] == []
 
 
 def test_close_positions_accepts_128_character_id_without_overflow(sessions, client):
@@ -267,6 +282,6 @@ def test_close_positions_accepts_128_character_id_without_overflow(sessions, cli
     replayed = client.post("/api/v1/positions/close", json=payload)
 
     assert created.status_code == 202
-    assert replayed.status_code == 202
+    assert replayed.status_code == 200
     assert replayed.json()["items"][0]["id"] == created.json()["items"][0]["id"]
     assert len(created.json()["items"][0]["request_id"]) <= 128

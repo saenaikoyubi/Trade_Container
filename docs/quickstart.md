@@ -2,9 +2,6 @@
 
 Bybit の設定外 USDT Linear Perpetual を API から指定する受入手順を含みます。対象市場の規則は [Bybit 動的銘柄対応](bybit-dynamic-symbols.md) を参照してください。
 
-> [!NOTE]
-> 設定外 Bybit 銘柄、Mark Priceによる停止銘柄の決済、分割全決済、親処理の照会・取消、および[API仕様](api.md)で定義した既存エンドポイントの契約変更は実装前の目標仕様です。以下の該当操作例は実装後の受入確認用です。
-
 ## 1. 事前準備
 
 ローカル開発および Paper 検証用の秘密情報ディレクトリと `.env.local` をセットアップスクリプトで自動作成します。
@@ -39,7 +36,7 @@ docker compose --env-file .env.local -f docker/compose.yaml down
 
 ### 設定ファイル (`docker/share/volume/config/settings.json`)
 
-現在の設定ファイルは[settings.json](../docker/share/volume/config/settings.json)です。Bybit、Binance、dYdXを同時に設定でき、下記はBybit USDT無期限とPaper口座に必要な目標仕様の抜粋です。現行コードには未対応の`metadata_ttl_seconds`を含みます。実装後、変更時は`trade-api`と`paper-executor`を再起動してください。
+現在の設定ファイルは[settings.json](../docker/share/volume/config/settings.json)です。Bybit、Binance、dYdXを同時に設定でき、下記はBybit USDT無期限とPaper口座に必要な設定の抜粋です。変更時は`trade-api`と`paper-executor`を再起動してください。
 
 ```json
 {
@@ -69,7 +66,7 @@ docker compose --env-file .env.local -f docker/compose.yaml down
 }
 ```
 
-抜粋にない他取引所の手数料、ポーリング、市場データ鮮度、リスク上限、およびBinance・dYdXの設定は正本を参照してください。Bybit の`symbols`配列は銘柄省略時に返す既定一覧であり、明示指定できる USDT Linear Perpetual の許可一覧ではありません。Bybit のDB・APIで使うcanonical表記は`BTCUSDT`のような大文字市場IDです。
+抜粋にない他取引所の手数料、ポーリング、市場データ鮮度、リスク上限、およびBinance・dYdXの設定は正本を参照してください。Bybit の`symbols`配列は銘柄省略時に返す既定一覧であり、明示指定できる USDT Linear Perpetual の許可一覧ではありません。`symbols: []`なら明示指定専用です。`exchanges: {}`も有効な設定です。Bybit のDB・APIで使うcanonical表記は`BTCUSDT`のような大文字市場IDです。
 
 ## 3. trade-ui の操作
 
@@ -78,7 +75,7 @@ docker compose --env-file .env.local -f docker/compose.yaml down
 - **ポジション管理**: ポジション一覧・未実現損益確認、個別 / 一括全決済
 - **注文管理**: 未完了注文の一覧と個別取消要求
 - **手動注文**: 成行・指値注文、Reduce-only 指定
-- **取引制御**: Close-only の切替（新規注文受付拒否および未完了注文の取消要求）
+- **取引制御**: Close-only と Kill Switch の切替（新規注文受付拒否および未完了注文の取消要求）
 
 > [!WARNING]
 > **運用分離ポリシー**: Bot 稼働中は手動発注を行わず、緊急時のポジション確認・手動全決済専用として運用してください。注文の所属追跡性（`strategy_id`）の担保および意図しないポジション合算を防ぐためです。

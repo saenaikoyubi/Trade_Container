@@ -81,3 +81,29 @@ def test_settings_parse_exchange_options_and_paper_account(tmp_path):
     assert config.account.currency == "USDT"
     assert str(config.account.initial_balance) == "25000"
     assert str(config.account.default_leverage) == "5"
+
+
+def test_empty_exchange_and_bybit_default_symbol_lists_are_allowed(tmp_path):
+    config_file = tmp_path / "settings.json"
+    common = {
+        "risk": {
+            "max_order_quantity": "10", "max_order_notional": "50000",
+            "max_position_notional": "100000", "max_daily_loss": "5000",
+            "max_price_deviation_pct": "0.05", "max_orders_per_minute": 60,
+        },
+    }
+    config_file.write_text(json.dumps({**common, "exchanges": {}}), encoding="utf-8")
+    assert Settings.from_file(config_file).exchanges == {}
+
+    config_file.write_text(json.dumps({
+        **common,
+        "exchanges": {"bybit": {
+            "adapter": "ccxt", "symbols": [],
+            "options": {"defaultType": "linear"},
+            "metadata_ttl_seconds": 120,
+            "fees": {"maker": "0.0002", "taker": "0.00055"},
+        }},
+    }), encoding="utf-8")
+    config = Settings.from_file(config_file)
+    assert config.exchanges["bybit"].symbols == ()
+    assert config.exchanges["bybit"].metadata_ttl_seconds == 120

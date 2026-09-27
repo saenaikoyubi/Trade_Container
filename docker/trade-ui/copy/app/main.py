@@ -5,7 +5,7 @@ import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -242,8 +242,28 @@ async def set_close_only(payload: UiControlUpdate, request: Request):
     )
 
 
+@app.post("/ui-api/kill-switch", include_in_schema=False)
+async def set_kill_switch(payload: UiControlUpdate, request: Request):
+    _require_same_origin(request)
+    return await _proxy_post(
+        "/api/v1/kill-switch",
+        payload.model_dump(mode="json", exclude_none=True),
+    )
+
+
+@app.get("/ui-api/close-requests/{request_id}", include_in_schema=False)
+async def get_close_request(request_id: str):
+    return await _proxy_get(f"/api/v1/close-requests/{quote(request_id, safe='')}")
+
+
+@app.post("/ui-api/close-requests/{request_id}/cancel", include_in_schema=False)
+async def cancel_close_request(request_id: str, request: Request):
+    _require_same_origin(request)
+    return await _proxy_post(f"/api/v1/close-requests/{quote(request_id, safe='')}/cancel")
+
+
 @app.get("/ui-api/orders/{order_id}/fills", include_in_schema=False)
-async def order_fills(order_id: str):
+async def order_fills(order_id: str, request: Request):
     if not ORDER_ID_PATTERN.fullmatch(order_id):
         return Response(
             content=b'{"detail":"invalid order id"}',
@@ -251,7 +271,10 @@ async def order_fills(order_id: str):
             media_type="application/json",
             headers={"Cache-Control": "no-store"},
         )
-    return await _proxy_get(f"/api/v1/orders/{order_id}/fills")
+    return await _proxy_get(
+        f"/api/v1/orders/{order_id}/fills",
+        _query_params(request, {"cursor", "limit"}),
+    )
 
 
 @app.post("/ui-api/orders/{order_id}/cancel", include_in_schema=False)

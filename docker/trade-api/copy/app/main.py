@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import binascii
 import asyncio
-import hashlib
 import json
 import hmac
 import logging
@@ -17,16 +16,21 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import and_, or_, select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from trade_common.config import read_secret, settings
+from trade_common.close_service import active_parent_for_position, all_children, append_child, cancel_parent, refresh_parent
 from trade_common.database import engine, session_factory
 from trade_common.exchange_adapters import ExchangeAdapterPool
 from trade_common.logging_config import configure_logging
-from trade_common.models import ControlFlag, DailyPnl, Fill, Order, Position
-from trade_common.risk import validate_instrument_quantity
+from trade_common.market_rules import (
+    ACTIVE_CLOSE_STATUSES, MarketRuleError, TERMINAL_ORDER_STATUSES,
+    bybit_history_symbols, bybit_local_canonical, fresh_mark_price, positive_decimal,
+)
+from trade_common.models import CloseRequest, CloseRequestPosition, ControlFlag, DailyPnl, Fill, Order, Position, RequestKey
+from trade_common.risk import validate_instrument_market, validate_instrument_quantity
 from trade_common.valuation import (
     ValuationError,
     calculate_account_balance,
@@ -42,7 +46,6 @@ LOGGER = logging.getLogger(__name__)
 NON_TERMINAL_ORDER_STATUSES = ("pending", "processing", "open", "partially_filled")
 REQUEST_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 METADATA_RETRY_DELAYS = (1, 2, 4, 8, 16, 32, 60)
-METADATA_REFRESH_INTERVAL_SECONDS = 60 * 60
 
 
 async def _warm_bybit_once(application: FastAPI) -> bool:
@@ -51,7 +54,8 @@ async def _warm_bybit_once(application: FastAPI) -> bool:
         return True
     try:
         adapter = await asyncio.to_thread(pool.get, "bybit")
-        await asyncio.to_thread(adapter.fetch_instruments)
+        refresh = getattr(adapter, "refresh_metadata", None)
+        await asyncio.to_thread(refresh if callable(refresh) else adapter.fetch_instruments)
     except Exception as exc:
         application.state.bybit_metadata = {"ready": False, "last_error": str(exc)}
         LOGGER.warning("Bybit metadata warmup failed", exc_info=True)
@@ -73,7 +77,7 @@ async def _maintain_bybit_metadata(application: FastAPI, initially_fresh: bool) 
     attempt = 0 if initially_fresh else 1
     while True:
         delay = (
-            METADATA_REFRESH_INTERVAL_SECONDS
+            application.state.runtime_config.exchanges["bybit"].metadata_ttl_seconds
             if fresh
             else METADATA_RETRY_DELAYS[min(attempt - 1, len(METADATA_RETRY_DELAYS) - 1)]
         )
@@ -122,6 +126,17 @@ async def lifespan(application: FastAPI):
 
 
 app = FastAPI(title="Trade Container API", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(MarketRuleError)
+def market_rule_error(_request, exc: MarketRuleError):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail, "reason_code": exc.reason_code})
+
+
+@app.exception_handler(SQLAlchemyError)
+def database_error(_request, _exc: SQLAlchemyError):
+    LOGGER.exception("database operation failed")
+    return JSONResponse(status_code=503, content={"detail": "database is unavailable"})
 
 
 class OrderCreate(BaseModel):
@@ -204,8 +219,8 @@ class PositionView(BaseModel):
 class CurrentPositionView(BaseModel):
     exchange_id: str
     symbol: str
-    base_asset: str
-    quote_asset: str
+    base_asset: str | None
+    quote_asset: str | None
     position_side: Literal["buy", "sell"]
     quantity: Decimal
     average_entry_price: Decimal
@@ -214,7 +229,8 @@ class CurrentPositionView(BaseModel):
     position_updated_at: datetime
     price_observed_at: datetime | None
     valuation_status: Literal["ok", "unavailable"]
-    valuation_error: str | None = None
+    valuation_reason_code: str | None
+    valuation_detail: str | None
 
 
 class CurrentPositionsView(BaseModel):
@@ -242,17 +258,20 @@ class InstrumentView(BaseModel):
     min_notional: Decimal | None
     quantity_unit: str | None = None
     status: str
+    new_or_increase_allowed: bool
+    new_or_increase_reason_code: str | None
 
 
 class PriceView(BaseModel):
     exchange_id: str
     symbol: str
     mark_price: Decimal | None
+    mark_observed_at: datetime | None
     last_price: Decimal | None
     bid_price: Decimal | None
     ask_price: Decimal | None
-    mid_price: Decimal
-    observed_at: datetime
+    mid_price: Decimal | None
+    observed_at: datetime | None
 
 
 class BalanceView(BaseModel):
@@ -292,6 +311,11 @@ class PnlHistoryView(BaseModel):
     points: list[PnlHistoryPoint]
 
 
+class PnlView(BaseModel):
+    currency: str
+    realized_pnl: Decimal
+
+
 class KillSwitchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -320,11 +344,38 @@ class TradingControlView(BaseModel):
     close_only: bool
     reason: str | None
     updated_at: datetime
-    cancellation_requested_count: int = 0
 
 
-class CloseOrdersView(BaseModel):
+class TradingControlUpdateView(TradingControlView):
+    cancellation_requested_count: int
+
+
+class FillPage(BaseModel):
+    items: list[FillView]
+    next_cursor: str | None
+
+
+class ClosePositionView(BaseModel):
+    symbol: str
+    initial_position_quantity: Decimal
+    remaining_position_quantity: Decimal
+    status: str
+    reason_code: str | None
+    detail: str | None
+
+
+class CloseRequestView(BaseModel):
+    request_id: str
+    exchange_id: str
+    symbol: str | None
+    strategy_id: str | None
+    status: str
+    positions: list[ClosePositionView]
     items: list[OrderView]
+    reason_code: str | None
+    detail: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 def get_session():
@@ -350,7 +401,12 @@ Db = Annotated[Session, Depends(get_session)]
 
 def _runtime_settings():
     runtime_config = getattr(app.state, "runtime_config", None)
-    return runtime_config if runtime_config is not None else settings()
+    if runtime_config is not None:
+        return runtime_config
+    try:
+        return settings()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="configuration is unavailable") from exc
 
 
 def _runtime_pool(config) -> ExchangeAdapterPool:
@@ -378,10 +434,12 @@ def _exchange_config(config, exchange_id: str):
 def _canonical_symbol(config, exchange, raw_symbol: str) -> str:
     if raw_symbol != raw_symbol.strip():
         raise HTTPException(status_code=422, detail="symbol must not contain surrounding whitespace")
-    if raw_symbol in exchange.symbols:
+    if exchange.exchange_id != "bybit" and raw_symbol in exchange.symbols:
         return raw_symbol
     try:
         return _runtime_pool(config).get(exchange.exchange_id).resolve_symbol(raw_symbol)
+    except MarketRuleError:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="symbol is not allowed for exchange") from exc
     except RuntimeError as exc:
@@ -392,56 +450,21 @@ def _canonical_symbol(config, exchange, raw_symbol: str) -> str:
         raise HTTPException(status_code=503, detail="instrument metadata is unavailable") from exc
 
 
-def _cached_history_canonical(config, exchange, raw_symbol: str) -> str | None:
-    if raw_symbol in exchange.symbols:
-        return raw_symbol
-    pool = getattr(app.state, "adapter_pool", None)
-    if pool is None or getattr(pool, "config", None) != config:
-        return None
-    adapter = _existing_adapter(pool, exchange.exchange_id)
-    resolver = getattr(adapter, "resolve_cached_symbol", None) if adapter is not None else None
-    if not callable(resolver):
-        return None
-    try:
-        canonical = resolver(raw_symbol)
-    except Exception:
-        LOGGER.debug(
-            "cached history symbol resolution failed: exchange=%s symbol=%s",
-            exchange.exchange_id,
-            raw_symbol,
-            exc_info=True,
-        )
-        return None
-    return canonical if canonical in exchange.symbols else None
-
-
 def _history_symbol_condition(model, exchange_id: str | None, raw_symbol: str):
-    if raw_symbol != raw_symbol.strip():
+    if not raw_symbol or raw_symbol != raw_symbol.strip():
         raise HTTPException(status_code=422, detail="symbol must not contain surrounding whitespace")
-    try:
-        config = _runtime_settings()
-    except Exception:
+    aliases = bybit_history_symbols(raw_symbol)
+    if exchange_id == "bybit":
+        return model.symbol.in_(aliases)
+    if exchange_id is not None or len(aliases) == 1:
         return model.symbol == raw_symbol
-    if exchange_id is not None:
-        exchange = config.exchange(exchange_id)
-        if exchange is None:
-            return model.symbol == raw_symbol
-        canonical = _cached_history_canonical(config, exchange, raw_symbol)
-        if canonical is None or canonical == raw_symbol:
-            return model.symbol == raw_symbol
-        return model.symbol.in_((raw_symbol, canonical))
-    matches = [model.symbol == raw_symbol]
-    for exchange in config.exchanges.values():
-        canonical = _cached_history_canonical(config, exchange, raw_symbol)
-        if canonical is not None and canonical != raw_symbol:
-            matches.append(and_(model.exchange_id == exchange.exchange_id, model.symbol == canonical))
-    return or_(*matches)
+    return or_(model.symbol == raw_symbol, and_(model.exchange_id == "bybit", model.symbol == aliases[1]))
 
 
 def _validate_date_range(from_date: date | None, to_date: date | None) -> None:
     if from_date and to_date and from_date > to_date:
         raise HTTPException(status_code=422, detail="from must not be after to")
-    if from_date and to_date and (to_date - from_date).days > 3660:
+    if from_date and to_date and (to_date - from_date).days + 1 > 3660:
         raise HTTPException(status_code=422, detail="date range must not exceed 3660 days")
 
 
@@ -468,6 +491,26 @@ def _decode_cursor(cursor: str) -> tuple[datetime, str]:
     except (binascii.Error, KeyError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=422, detail="invalid cursor") from exc
     return timestamp, item_id
+
+
+def _close_view(db: Session, parent: CloseRequest) -> CloseRequestView:
+    targets = list(db.scalars(select(CloseRequestPosition).where(
+        CloseRequestPosition.close_request_id == parent.id
+    ).order_by(CloseRequestPosition.symbol)).all())
+    return CloseRequestView(
+        request_id=parent.request_id, exchange_id=parent.exchange_id,
+        symbol=parent.symbol, strategy_id=parent.strategy_id,
+        status=parent.status,
+        positions=[ClosePositionView.model_validate({
+            "symbol": item.symbol,
+            "initial_position_quantity": item.initial_position_quantity,
+            "remaining_position_quantity": item.remaining_position_quantity,
+            "status": item.status, "reason_code": item.reason_code, "detail": item.detail,
+        }) for item in targets],
+        items=[OrderView.model_validate(item) for item in all_children(db, parent.id)],
+        reason_code=parent.reason_code, detail=parent.detail,
+        created_at=parent.created_at, updated_at=parent.updated_at,
+    )
 
 
 @app.get("/health")
@@ -543,11 +586,34 @@ def list_instruments(
     exchange = _exchange_config(config, exchange_id)
     canonical = _canonical_symbol(config, exchange, symbol) if symbol is not None else None
     try:
-        return _runtime_pool(config).get(exchange_id).fetch_instruments(canonical)
+        items = _runtime_pool(config).get(exchange_id).fetch_instruments(canonical)
+        return [_instrument_view(item) for item in items]
+    except MarketRuleError:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="symbol is not allowed for exchange") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="instrument metadata is unavailable") from exc
+
+
+def _instrument_view(item: dict) -> dict:
+    result = dict(item)
+    invalid = set(item.get("_invalid_fields") or ())
+    if item.get("status") != "active":
+        reason = "instrument_not_tradable"
+    elif (
+        positive_decimal(item.get("min_qty")) is None
+        or positive_decimal(item.get("qty_step")) is None
+        or any(name in invalid for name in ("min_qty", "qty_step", "min_notional", "max_qty"))
+        or (item.get("min_notional") is not None and positive_decimal(item.get("min_notional")) is None)
+        or (item.get("max_qty") is not None and positive_decimal(item.get("max_qty")) is None)
+    ):
+        reason = "instrument_metadata_invalid"
+    else:
+        reason = None
+    result["new_or_increase_allowed"] = reason is None
+    result["new_or_increase_reason_code"] = reason
+    return result
 
 
 def _parse_symbols(config, exchange, raw_symbols: str | None) -> list[str]:
@@ -573,11 +639,18 @@ def list_prices(
     requested = _parse_symbols(config, exchange, symbols)
     try:
         prices = _runtime_pool(config).get(exchange_id).fetch_prices(requested)
+    except MarketRuleError:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="symbol is not allowed for exchange") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="market price is unavailable") from exc
-    if len(prices) != len(requested) or any(item.get("mid_price") is None for item in prices):
+    if len(prices) != len(requested):
+        raise HTTPException(status_code=503, detail="market price is unavailable")
+    if exchange_id == "bybit":
+        if any(positive_decimal(item.get("mark_price")) is None or item.get("mark_observed_at") is None for item in prices):
+            raise MarketRuleError("mark_price_unavailable", "fresh Mark Price is unavailable", 503)
+    elif any(item.get("mid_price") is None or item.get("observed_at") is None for item in prices):
         raise HTTPException(status_code=503, detail="market price is unavailable")
     return prices
 
@@ -600,14 +673,17 @@ def _control_flag(db: Session) -> ControlFlag:
     return item
 
 
-def _control_view(item: ControlFlag, *, cancellation_requested_count: int = 0) -> TradingControlView:
+def _control_view(item: ControlFlag) -> TradingControlView:
     return TradingControlView(
         kill_switch=bool(item.kill_switch),
         close_only=bool(item.close_only),
         reason=item.reason,
         updated_at=item.updated_at,
-        cancellation_requested_count=cancellation_requested_count,
     )
+
+
+def _control_update_view(item: ControlFlag, count: int) -> TradingControlUpdateView:
+    return TradingControlUpdateView(**_control_view(item).model_dump(), cancellation_requested_count=count)
 
 
 def _order_matches_payload(order: Order, payload: OrderCreate, canonical_symbol: str) -> bool:
@@ -644,53 +720,81 @@ def _validate_order_instrument(
     exchange,
     payload: OrderCreate,
     canonical_symbol: str,
-) -> None:
+) -> dict:
     try:
         adapter = _runtime_pool(config).get(exchange.exchange_id)
         instruments = adapter.fetch_instruments(canonical_symbol)
+    except MarketRuleError:
+        raise
     except Exception as exc:
+        if exchange.exchange_id == "bybit":
+            raise MarketRuleError("instrument_data_unavailable", f"instrument metadata is unavailable for {canonical_symbol}", 503) from exc
         raise HTTPException(status_code=503, detail="instrument metadata is unavailable") from exc
     if not instruments:
+        if exchange.exchange_id == "bybit":
+            raise MarketRuleError("instrument_data_unavailable", f"instrument metadata is unavailable for {canonical_symbol}", 503)
         raise HTTPException(status_code=503, detail="instrument metadata is unavailable")
     instrument = instruments[0]
+    position = db.scalar(select(Position).where(
+        Position.exchange_id == payload.exchange_id, Position.symbol == canonical_symbol
+    ))
+    position_quantity = Decimal(position.quantity) if position is not None else Decimal("0")
+    market_decision = validate_instrument_market(
+        instrument, exchange_id=payload.exchange_id, order_type=payload.order_type,
+        reduce_only=payload.reduce_only, position_quantity=position_quantity,
+        side=payload.side, quantity=payload.quantity,
+    )
+    if not market_decision.allowed:
+        if exchange.exchange_id == "bybit" and market_decision.reason_code:
+            raise MarketRuleError(market_decision.reason_code, market_decision.reason or "instrument is not tradable", 422)
+        raise HTTPException(status_code=422, detail=market_decision.reason)
+    is_full_close = _full_close(db, payload, canonical_symbol)
     price = payload.limit_price
-    if payload.order_type == "market" and instrument.get("min_notional") is not None:
+    if payload.order_type == "market" and exchange.exchange_id == "bybit" and instrument.get("status") != "active":
+        price, _ = fresh_mark_price(adapter, canonical_symbol)
+    elif payload.order_type == "market" and instrument.get("min_notional") is not None and not is_full_close:
         try:
-            price_items = adapter.fetch_prices([canonical_symbol])
-            price = Decimal(price_items[0]["mid_price"])
-        except Exception:
-            price = None
-            LOGGER.warning(
-                "market price unavailable during API notional validation; delegating to executor: exchange=%s symbol=%s",
-                exchange.exchange_id,
-                canonical_symbol,
-                exc_info=True,
+            book = adapter.fetch_order_book(canonical_symbol)
+            price, _ = order_book_midpoint(
+                book, now=datetime.now(timezone.utc),
+                max_age_seconds=config.market_data_max_age_seconds,
             )
+        except Exception as exc:
+            if exchange.exchange_id == "bybit":
+                raise MarketRuleError("order_book_unavailable", f"fresh order book is unavailable for {canonical_symbol}", 503) from exc
+            raise HTTPException(status_code=503, detail="market price is unavailable") from exc
     decision = validate_instrument_quantity(
         payload.quantity,
         price,
         instrument,
-        is_full_close=_full_close(db, payload, canonical_symbol),
+        is_full_close=is_full_close,
         order_type=payload.order_type,
     )
     if decision.allowed:
-        return
-    if decision.reason in {"instrument metadata is incomplete", "instrument metadata is invalid"}:
-        raise HTTPException(status_code=503, detail=decision.reason)
-    raise HTTPException(status_code=422, detail=decision.reason or "instrument quantity is invalid")
+        return instrument
+    if exchange.exchange_id == "bybit" and decision.reason_code:
+        raise MarketRuleError(decision.reason_code, decision.reason or "instrument metadata is invalid", 503 if decision.temporary else 422)
+    raise HTTPException(status_code=503 if decision.temporary else 422, detail=decision.reason or "instrument quantity is invalid")
 
 
 @app.post("/api/v1/orders", response_model=OrderView, status_code=status.HTTP_202_ACCEPTED)
 def create_order(payload: OrderCreate, response: Response, db: Db, _: Auth):
-    config = _runtime_settings()
+    key = db.get(RequestKey, payload.request_id)
+    if key is not None and key.operation_kind == "close_request":
+        raise HTTPException(status_code=409, detail="request_id is already used by a close request")
+    if db.scalar(select(CloseRequest).where(CloseRequest.request_id == payload.request_id)) is not None:
+        raise HTTPException(status_code=409, detail="request_id is already used by a close request")
     existing = db.scalar(select(Order).where(Order.request_id == payload.request_id))
     if existing is not None:
         if payload.exchange_id != existing.exchange_id:
             raise HTTPException(status_code=409, detail="request_id is already used by a different order")
-        exchange_config = _exchange_config(config, payload.exchange_id)
-        if payload.symbol == existing.symbol:
+        if payload.exchange_id == "bybit":
+            canonical_symbol = bybit_local_canonical(payload.symbol) or payload.symbol
+        elif payload.symbol == existing.symbol:
             canonical_symbol = existing.symbol
         else:
+            config = _runtime_settings()
+            exchange_config = _exchange_config(config, payload.exchange_id)
             adapter = _existing_adapter(_runtime_pool(config), payload.exchange_id)
             resolver = getattr(adapter, "resolve_cached_symbol", None) if adapter is not None else None
             canonical_symbol = resolver(payload.symbol) if callable(resolver) else None
@@ -700,14 +804,24 @@ def create_order(payload: OrderCreate, response: Response, db: Db, _: Auth):
             raise HTTPException(status_code=409, detail="request_id is already used by a different order")
         response.status_code = status.HTTP_200_OK
         return existing
+    if key is not None:
+        raise HTTPException(status_code=409, detail="request_id is already used")
+    config = _runtime_settings()
     exchange_config = _exchange_config(config, payload.exchange_id)
     canonical_symbol = _canonical_symbol(config, exchange_config, payload.symbol)
-    control = db.get(ControlFlag, 1)
+    control = db.get(ControlFlag, 1, with_for_update=True)
+    if control and control.kill_switch:
+        raise HTTPException(status_code=409, detail="kill switch is enabled")
     if control and control.close_only and not payload.reduce_only:
         raise HTTPException(
             status_code=409,
             detail=f"close-only mode is enabled: {control.reason or 'no reason'}",
         )
+    position = db.scalar(select(Position).where(
+        Position.exchange_id == payload.exchange_id, Position.symbol == canonical_symbol
+    ).with_for_update())
+    if position is not None and active_parent_for_position(db, position.id) is not None:
+        raise HTTPException(status_code=409, detail="a close request is already active for this position")
     _validate_order_instrument(db, config, exchange_config, payload, canonical_symbol)
 
     item = Order(
@@ -724,12 +838,14 @@ def create_order(payload: OrderCreate, response: Response, db: Db, _: Auth):
     )
     db.add(item)
     try:
+        db.flush()
+        db.add(RequestKey(request_id=payload.request_id, operation_kind="order", target_id=item.id))
         db.commit()
     except IntegrityError:
         db.rollback()
         existing = db.scalar(select(Order).where(Order.request_id == payload.request_id))
         if existing is None:
-            raise
+            raise HTTPException(status_code=409, detail="request_id or close request conflicts with an existing operation")
         if not _order_matches_payload(existing, payload, canonical_symbol):
             raise HTTPException(status_code=409, detail="request_id is already used by a different order")
         response.status_code = status.HTTP_200_OK
@@ -755,23 +871,59 @@ def get_order(order_id: str, db: Db, _: Auth):
 
 
 @app.post("/api/v1/orders/{order_id}/cancel", response_model=OrderView, status_code=202)
-def cancel_order(order_id: str, db: Db, _: Auth):
-    item = db.get(Order, order_id)
-    if item is None:
+def cancel_order(order_id: str, response: Response, db: Db, _: Auth):
+    snapshot = db.get(Order, order_id)
+    if snapshot is None:
         raise HTTPException(status_code=404, detail="order not found")
-    if item.status in {"filled", "canceled", "rejected", "failed"}:
+    exchange_id, symbol = snapshot.exchange_id, snapshot.symbol
+    parent_id = snapshot.close_request_id
+    db.expire_all()
+    db.get(ControlFlag, 1, with_for_update=True)
+    db.scalar(select(Position).where(
+        Position.exchange_id == exchange_id, Position.symbol == symbol
+    ).with_for_update())
+    parent = db.get(CloseRequest, parent_id, with_for_update=True) if parent_id else None
+    item = db.get(Order, order_id, with_for_update=True)
+    if item.status == "canceled":
+        response.status_code = 200
+        return item
+    if item.status in {"filled", "rejected", "failed"}:
         raise HTTPException(status_code=409, detail=f"order is already {item.status}")
     item.cancellation_requested = True
+    if parent is not None:
+        cancel_parent(db, parent, "a child order was canceled")
     db.commit()
     db.refresh(item)
     return item
 
 
-@app.get("/api/v1/orders/{order_id}/fills", response_model=list[FillView])
-def list_order_fills(order_id: str, db: Db, _: Auth):
+@app.get("/api/v1/orders/{order_id}/fills", response_model=FillPage)
+def list_order_fills(
+    order_id: str, db: Db, _: Auth,
+    cursor: str | None = None,
+    limit: int = Query(default=100, ge=1, le=200),
+):
     if db.get(Order, order_id) is None:
         raise HTTPException(status_code=404, detail="order not found")
-    return db.scalars(select(Fill).where(Fill.order_id == order_id).order_by(Fill.sequence)).all()
+    after_sequence = 0
+    if cursor is not None:
+        try:
+            raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+            payload = json.loads(raw.decode("utf-8"))
+            if payload["order_id"] != order_id or not isinstance(payload["sequence"], int) or payload["sequence"] < 1:
+                raise ValueError("cursor belongs to another order")
+            after_sequence = payload["sequence"]
+        except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="invalid cursor") from exc
+    rows = list(db.scalars(select(Fill).where(
+        Fill.order_id == order_id, Fill.sequence > after_sequence
+    ).order_by(Fill.sequence).limit(limit + 1)).all())
+    items = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and items:
+        payload = json.dumps({"order_id": order_id, "sequence": items[-1].sequence}, separators=(",", ":"))
+        next_cursor = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+    return FillPage(items=items, next_cursor=next_cursor)
 
 
 @app.get("/api/v1/history/orders", response_model=OrderHistoryPage)
@@ -796,7 +948,7 @@ def list_order_history(
         query = query.where(Order.created_at < end)
     if exchange_id:
         query = query.where(Order.exchange_id == exchange_id)
-    if symbol:
+    if symbol is not None:
         query = query.where(_history_symbol_condition(Order, exchange_id, symbol))
     if side:
         query = query.where(Order.side == side)
@@ -839,7 +991,7 @@ def list_fill_history(
         query = query.where(Fill.executed_at < end)
     if exchange_id:
         query = query.where(Fill.exchange_id == exchange_id)
-    if symbol:
+    if symbol is not None:
         query = query.where(_history_symbol_condition(Fill, exchange_id, symbol))
     if side:
         query = query.where(Fill.side == side)
@@ -865,22 +1017,22 @@ def pnl_history(
     from_date: date | None = Query(default=None, alias="from"),
     to_date: date | None = Query(default=None, alias="to"),
 ):
-    _validate_date_range(from_date, to_date)
-    query = select(DailyPnl)
-    if from_date:
-        query = query.where(DailyPnl.trade_date >= from_date)
-    if to_date:
-        query = query.where(DailyPnl.trade_date <= to_date)
+    today = datetime.now(timezone.utc).date()
+    effective_to = to_date or today
+    effective_from = from_date or effective_to - timedelta(days=364)
+    if effective_to > today or effective_from > today:
+        raise HTTPException(status_code=422, detail="future dates are not allowed")
+    _validate_date_range(effective_from, effective_to)
+    query = select(DailyPnl).where(
+        DailyPnl.trade_date >= effective_from,
+        DailyPnl.trade_date <= effective_to,
+    )
     rows = list(db.scalars(query.order_by(DailyPnl.trade_date)).all())
-
-    effective_from = from_date or (rows[0].trade_date if rows else None)
-    effective_to = to_date or (rows[-1].trade_date if rows else None)
-    if effective_from and effective_to:
-        _validate_date_range(effective_from, effective_to)
-
     values = {item.trade_date: Decimal(item.realized_pnl) for item in rows}
     points: list[PnlHistoryPoint] = []
-    cumulative = Decimal("0")
+    cumulative = Decimal(db.scalar(select(func.coalesce(func.sum(DailyPnl.realized_pnl), 0)).where(
+        DailyPnl.trade_date < effective_from
+    )) or 0)
     current = effective_from
     while current is not None and effective_to is not None and current <= effective_to:
         daily = values.get(current, Decimal("0"))
@@ -920,74 +1072,80 @@ def list_positions(
     db: Db,
     _: Auth,
     exchange_id: str | None = Query(default=None, min_length=1, max_length=32),
+    symbol: str | None = None,
 ):
     query = select(Position)
     if exchange_id:
         query = query.where(Position.exchange_id == exchange_id)
+    if symbol is not None:
+        query = query.where(_history_symbol_condition(Position, exchange_id, symbol))
     query = query.order_by(Position.exchange_id, Position.symbol)
     return db.scalars(query).all()
 
 
-def _existing_close_orders(
-    db: Session,
-    *,
-    request_prefix: str,
-    exchange_id: str,
-    symbol: str | None,
-    strategy_id: str | None,
-) -> list[Order]:
-    items = list(
-        db.scalars(
-            select(Order)
-            .where(Order.request_id.startswith(request_prefix, autoescape=True))
-            .order_by(Order.symbol, Order.created_at)
-        ).all()
+def _same_close_input(parent: CloseRequest, payload: PositionCloseRequest) -> bool:
+    if parent.exchange_id != payload.exchange_id or parent.strategy_id != payload.strategy_id:
+        return False
+    if payload.symbol is None:
+        return parent.symbol is None
+    if parent.symbol is None:
+        return False
+    if payload.symbol in {parent.submitted_symbol, parent.symbol}:
+        return True
+    return payload.exchange_id == "bybit" and bybit_local_canonical(payload.symbol) == parent.symbol
+
+
+def _close_market_cap(exchange_id: str, symbol: str, quantity: Decimal, instrument: dict) -> Decimal:
+    decision = validate_instrument_quantity(
+        min(quantity, positive_decimal(instrument.get("max_market_qty")) or quantity),
+        None, instrument, is_close_child=True, order_type="market",
     )
-    if not items:
-        return []
-    if any(
-        item.exchange_id != exchange_id
-        or item.order_type != "market"
-        or not item.reduce_only
-        or (symbol is not None and item.symbol != symbol)
-        or item.strategy_id != strategy_id
-        for item in items
-    ):
-        raise HTTPException(status_code=409, detail="request_id is already used by a different operation")
-    return items
-
-
-def _close_request_prefix(request_id: str) -> str:
-    if len(request_id) <= 64:
-        return f"gui-close:{request_id}:"
-    digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
-    return f"gui-close:{digest}:"
+    if decision.temporary:
+        if exchange_id == "bybit":
+            raise MarketRuleError(decision.reason_code or "instrument_metadata_invalid", decision.reason or "instrument metadata is invalid", 503)
+        raise HTTPException(status_code=503, detail=decision.reason)
+    cap = quantity
+    if exchange_id == "bybit":
+        market_cap = positive_decimal(instrument.get("max_market_qty"))
+        if market_cap is None:
+            raise MarketRuleError("instrument_metadata_invalid", f"max_market_qty is missing or invalid for {symbol}", 503)
+        cap = min(cap, market_cap)
+    max_qty = instrument.get("max_qty")
+    if max_qty is not None:
+        parsed = positive_decimal(max_qty)
+        if parsed is None:
+            if exchange_id == "bybit":
+                raise MarketRuleError("instrument_metadata_invalid", f"max_qty is invalid for {symbol}", 503)
+            raise HTTPException(status_code=503, detail="max_qty is invalid")
+        cap = min(cap, parsed)
+    return cap
 
 
 @app.post(
     "/api/v1/positions/close",
-    response_model=CloseOrdersView,
+    response_model=CloseRequestView,
     status_code=status.HTTP_202_ACCEPTED,
 )
-def close_positions(payload: PositionCloseRequest, db: Db, _: Auth):
+def close_positions(payload: PositionCloseRequest, response: Response, db: Db, _: Auth):
+    key = db.get(RequestKey, payload.request_id)
+    existing_parent = db.scalar(select(CloseRequest).where(CloseRequest.request_id == payload.request_id))
+    if existing_parent is not None:
+        if not _same_close_input(existing_parent, payload):
+            raise HTTPException(status_code=409, detail="request_id is already used by a different close request")
+        response.status_code = 200
+        return _close_view(db, existing_parent)
+    if key is not None or db.scalar(select(Order).where(Order.request_id == payload.request_id)) is not None:
+        raise HTTPException(status_code=409, detail="request_id is already used by an order")
     config = _runtime_settings()
     exchange_config = _exchange_config(config, payload.exchange_id)
+    control = db.get(ControlFlag, 1, with_for_update=True)
+    if control is not None and control.kill_switch:
+        raise HTTPException(status_code=409, detail="kill switch is enabled")
     canonical_symbol = (
         _canonical_symbol(config, exchange_config, payload.symbol)
         if payload.symbol is not None
         else None
     )
-
-    request_prefix = _close_request_prefix(payload.request_id)
-    existing = _existing_close_orders(
-        db,
-        request_prefix=request_prefix,
-        exchange_id=payload.exchange_id,
-        symbol=canonical_symbol,
-        strategy_id=payload.strategy_id,
-    )
-    if existing:
-        return CloseOrdersView(items=existing)
 
     query = (
         select(Position)
@@ -1001,75 +1159,112 @@ def close_positions(payload: PositionCloseRequest, db: Db, _: Auth):
     if canonical_symbol:
         query = query.where(Position.symbol == canonical_symbol)
     positions = list(db.scalars(query).all())
-    if not positions:
-        raise HTTPException(status_code=409, detail="no open position exists")
+    for position in positions:
+        if active_parent_for_position(db, position.id) is not None:
+            raise HTTPException(status_code=409, detail="a close request is already active for this position")
 
-    close_payloads = [
-        OrderCreate(
-            request_id=f"{request_prefix}{position.id}",
-            strategy_id=payload.strategy_id,
-            exchange_id=position.exchange_id,
-            symbol=position.symbol,
-            side="sell" if Decimal(position.quantity) > 0 else "buy",
-            order_type="market",
-            quantity=abs(Decimal(position.quantity)),
-            reduce_only=True,
-        )
-        for position in positions
-    ]
-    for close_payload in close_payloads:
-        _validate_order_instrument(
-            db,
-            config,
-            exchange_config,
-            close_payload,
-            close_payload.symbol,
-        )
+    caps: dict[str, Decimal] = {}
+    if positions:
+        adapter = _runtime_pool(config).get(payload.exchange_id)
+        for position in positions:
+            symbol = position.symbol
+            quantity = abs(Decimal(position.quantity))
+            try:
+                instrument = adapter.fetch_instruments(symbol)[0]
+            except MarketRuleError:
+                raise
+            except Exception as exc:
+                if payload.exchange_id == "bybit":
+                    raise MarketRuleError("instrument_data_unavailable", f"instrument metadata is unavailable for {symbol}", 503) from exc
+                raise HTTPException(status_code=503, detail="instrument metadata is unavailable") from exc
+            market_decision = validate_instrument_market(
+                instrument, exchange_id=payload.exchange_id, order_type="market", reduce_only=True,
+                position_quantity=Decimal(position.quantity),
+                side="sell" if position.quantity > 0 else "buy", quantity=quantity,
+            )
+            if not market_decision.allowed:
+                if payload.exchange_id == "bybit" and market_decision.reason_code:
+                    raise MarketRuleError(market_decision.reason_code, market_decision.reason or "unsupported market", 422)
+                raise HTTPException(status_code=422, detail=market_decision.reason)
+            caps[symbol] = _close_market_cap(payload.exchange_id, symbol, quantity, instrument)
+            if payload.exchange_id == "bybit" and instrument.get("status") != "active":
+                fresh_mark_price(adapter, symbol)
+            else:
+                try:
+                    book = adapter.fetch_order_book(symbol)
+                    order_book_midpoint(
+                        book, now=datetime.now(timezone.utc),
+                        max_age_seconds=config.market_data_max_age_seconds,
+                    )
+                except Exception as exc:
+                    if payload.exchange_id == "bybit":
+                        raise MarketRuleError("order_book_unavailable", f"fresh order book is unavailable for {symbol}", 503) from exc
+                    raise HTTPException(status_code=503, detail="market price is unavailable") from exc
 
-    cancel_query = (
-        update(Order)
-        .where(
-            Order.exchange_id == payload.exchange_id,
-            Order.status.in_(NON_TERMINAL_ORDER_STATUSES),
-        )
-        .values(cancellation_requested=True)
+    parent = CloseRequest(
+        request_id=payload.request_id, exchange_id=payload.exchange_id,
+        symbol=canonical_symbol, submitted_symbol=payload.symbol,
+        strategy_id=payload.strategy_id, status="queued" if positions else "completed",
     )
-    if canonical_symbol:
-        cancel_query = cancel_query.where(Order.symbol == canonical_symbol)
-    db.execute(cancel_query)
-
-    items = [
-        Order(
-            request_id=close_payload.request_id,
-            strategy_id=close_payload.strategy_id,
-            exchange_id=close_payload.exchange_id,
-            exchange_network=config.exchange_network,
-            symbol=close_payload.symbol,
-            side=close_payload.side,
-            order_type="market",
-            quantity=close_payload.quantity,
-            reduce_only=True,
-        )
-        for close_payload in close_payloads
-    ]
-    db.add_all(items)
+    db.add(parent)
     try:
+        db.flush()
+        db.add(RequestKey(request_id=payload.request_id, operation_kind="close_request", target_id=parent.id))
+        for position in positions:
+            target = CloseRequestPosition(
+                close_request_id=parent.id, position_id=position.id, symbol=position.symbol,
+                initial_position_quantity=position.quantity,
+                remaining_position_quantity=position.quantity, status="queued",
+            )
+            db.add(target)
+            db.flush()
+            db.execute(update(Order).where(
+                Order.exchange_id == payload.exchange_id,
+                Order.symbol == position.symbol,
+                Order.status.in_(NON_TERMINAL_ORDER_STATUSES),
+            ).values(cancellation_requested=True))
+            remaining = abs(Decimal(position.quantity))
+            cap = caps[position.symbol]
+            while remaining > 0:
+                chunk = min(remaining, cap)
+                append_child(db, parent, target, quantity=chunk, network=config.exchange_network)
+                remaining -= chunk
         db.commit()
     except IntegrityError:
         db.rollback()
-        existing = _existing_close_orders(
-            db,
-            request_prefix=request_prefix,
-            exchange_id=payload.exchange_id,
-            symbol=canonical_symbol,
-            strategy_id=payload.strategy_id,
-        )
-        if existing:
-            return CloseOrdersView(items=existing)
-        raise
-    for item in items:
-        db.refresh(item)
-    return CloseOrdersView(items=items)
+        existing_parent = db.scalar(select(CloseRequest).where(CloseRequest.request_id == payload.request_id))
+        if existing_parent is not None and _same_close_input(existing_parent, payload):
+            response.status_code = 200
+            return _close_view(db, existing_parent)
+        raise HTTPException(status_code=409, detail="close request conflicts with an existing operation")
+    db.refresh(parent)
+    if not positions:
+        response.status_code = 200
+    return _close_view(db, parent)
+
+
+@app.get("/api/v1/close-requests/{request_id}", response_model=CloseRequestView)
+def get_close_request(request_id: str, db: Db, _: Auth):
+    parent = db.scalar(select(CloseRequest).where(CloseRequest.request_id == request_id))
+    if parent is None:
+        raise HTTPException(status_code=404, detail="close request not found")
+    return _close_view(db, parent)
+
+
+@app.post("/api/v1/close-requests/{request_id}/cancel", response_model=CloseRequestView, status_code=202)
+def cancel_close_request(request_id: str, response: Response, db: Db, _: Auth):
+    parent = db.scalar(select(CloseRequest).where(CloseRequest.request_id == request_id).with_for_update())
+    if parent is None:
+        raise HTTPException(status_code=404, detail="close request not found")
+    if parent.status == "canceled":
+        response.status_code = 200
+        return _close_view(db, parent)
+    if parent.status in {"completed", "failed"}:
+        raise HTTPException(status_code=409, detail=f"close request is already {parent.status}")
+    cancel_parent(db, parent, "close request was canceled")
+    db.commit()
+    db.refresh(parent)
+    return _close_view(db, parent)
 
 
 def _public_exchange(config):
@@ -1084,15 +1279,16 @@ def current_positions(
     symbol: str | None = None,
 ):
     config = _runtime_settings()
-    exchange_config = _exchange_config(config, exchange_id)
-    canonical_symbol = _canonical_symbol(config, exchange_config, symbol) if symbol else None
-
+    exchange_config = config.exchange(exchange_id)
+    has_saved_row = db.scalar(select(Position.id).where(Position.exchange_id == exchange_id).limit(1)) is not None
+    if exchange_config is None and not has_saved_row:
+        raise HTTPException(status_code=422, detail="exchange is not configured and has no saved positions")
     query = select(Position).where(
         Position.exchange_id == exchange_id,
         Position.quantity != 0,
     )
-    if canonical_symbol:
-        query = query.where(Position.symbol == canonical_symbol)
+    if symbol is not None:
+        query = query.where(_history_symbol_condition(Position, exchange_id, symbol))
     stored_positions = list(db.scalars(query.order_by(Position.symbol)).all())
     refreshed_at = datetime.now(timezone.utc)
     if not stored_positions:
@@ -1106,45 +1302,51 @@ def current_positions(
         )
 
     adapter = None
-    adapter_error = False
-    try:
-        adapter = _public_exchange(exchange_config)
-    except Exception:
-        adapter_error = True
-        LOGGER.exception("public market adapter initialization failed")
+    if exchange_config is not None:
+        try:
+            adapter = _runtime_pool(config).get(exchange_id)
+        except Exception:
+            LOGGER.warning("public market adapter initialization failed: exchange=%s", exchange_id, exc_info=True)
 
     items: list[CurrentPositionView] = []
     for stored in stored_positions:
         quantity = Decimal(stored.quantity)
         average_entry_price = Decimal(stored.average_entry_price)
-        base_asset, quote_asset = market_assets(None, stored.symbol)
-        if adapter is not None:
-            try:
-                base_asset, quote_asset = market_assets(adapter.market(stored.symbol), stored.symbol)
-            except Exception:
-                LOGGER.warning("market metadata lookup failed: symbol=%s", stored.symbol, exc_info=True)
-
+        base_asset = quote_asset = None
         current_price = None
         position_pnl = None
         price_observed_at = None
         valuation_status = "unavailable"
-        valuation_error = "market data is unavailable" if adapter_error else None
+        reason_code = "exchange_not_configured" if exchange_config is None else "instrument_data_unavailable"
+        detail = "exchange is not configured" if exchange_config is None else "instrument metadata is unavailable"
         if adapter is not None:
             try:
-                book = adapter.fetch_order_book(stored.symbol)
-                current_price, price_observed_at = order_book_midpoint(
-                    book,
-                    now=datetime.now(timezone.utc),
-                    max_age_seconds=config.market_data_max_age_seconds,
-                )
+                instrument = adapter.fetch_instruments(stored.symbol)[0]
+                base_asset = instrument.get("base_asset") or None
+                quote_asset = instrument.get("quote_asset") or None
+                settle = instrument.get("settle_asset") or (quote_asset if exchange_id != "bybit" else None)
+                if not base_asset or not quote_asset or not settle:
+                    reason_code = "instrument_metadata_invalid"
+                    raise ValuationError("valuation instrument metadata is incomplete")
+                if settle not in {"USD", "USDC", "USDT"}:
+                    reason_code = "unsupported_settlement_currency"
+                    raise ValuationError(f"unsupported settlement currency: {settle}")
+                if exchange_id == "bybit":
+                    reason_code = "mark_price_unavailable"
+                    current_price, price_observed_at = fresh_mark_price(adapter, stored.symbol)
+                else:
+                    reason_code = "order_book_unavailable"
+                    book = adapter.fetch_order_book(stored.symbol)
+                    current_price, price_observed_at = order_book_midpoint(
+                        book, now=datetime.now(timezone.utc),
+                        max_age_seconds=config.market_data_max_age_seconds,
+                    )
                 position_pnl = unrealized_pnl(quantity, average_entry_price, current_price)
                 valuation_status = "ok"
-            except ValuationError as exc:
-                valuation_error = str(exc)
-                LOGGER.warning("position valuation rejected: symbol=%s reason=%s", stored.symbol, exc)
-            except Exception:
-                valuation_error = "market data is unavailable"
-                LOGGER.warning("position valuation failed: symbol=%s", stored.symbol, exc_info=True)
+                reason_code = detail = None
+            except Exception as exc:
+                detail = str(exc) or "market data is unavailable"
+                LOGGER.warning("position valuation failed: symbol=%s reason=%s", stored.symbol, detail)
 
         items.append(
             CurrentPositionView(
@@ -1160,7 +1362,8 @@ def current_positions(
                 position_updated_at=stored.updated_at,
                 price_observed_at=price_observed_at,
                 valuation_status=valuation_status,
-                valuation_error=valuation_error,
+                valuation_reason_code=reason_code,
+                valuation_detail=detail,
             )
         )
 
@@ -1178,14 +1381,11 @@ def current_positions(
     )
 
 
-@app.get("/api/v1/pnl")
+@app.get("/api/v1/pnl", response_model=PnlView)
 def pnl(db: Db, _: Auth):
-    positions = db.scalars(select(Position)).all()
-    return {
-        "realized_pnl": str(sum((Decimal(item.realized_pnl) for item in positions), Decimal("0"))),
-        "unrealized_pnl": None,
-        "note": "unrealized PnL requires a current market price and is not included in this endpoint",
-    }
+    config = _runtime_settings()
+    realized = db.scalar(select(func.coalesce(func.sum(DailyPnl.realized_pnl), 0))) or 0
+    return PnlView(currency=config.account.currency, realized_pnl=Decimal(realized))
 
 
 @app.get("/api/v1/trading-control", response_model=TradingControlView)
@@ -1193,13 +1393,18 @@ def trading_control(db: Db, _: Auth):
     return _control_view(_control_flag(db))
 
 
-@app.post("/api/v1/close-only", response_model=TradingControlView)
+@app.post("/api/v1/close-only", response_model=TradingControlUpdateView)
 def set_close_only(payload: KillSwitchRequest, db: Db, _: Auth):
-    item = _control_flag(db)
-    item.close_only = payload.enabled
+    item = db.get(ControlFlag, 1, with_for_update=True) or _control_flag(db)
+    if item.close_only != payload.enabled:
+        item.close_only = payload.enabled
     if payload.enabled:
-        item.kill_switch = False
-    item.reason = payload.reason
+        if item.kill_switch:
+            item.kill_switch = False
+        if item.reason != payload.reason:
+            item.reason = payload.reason
+    elif not item.kill_switch and item.reason is not None:
+        item.reason = None
     cancellation_requested_count = 0
     if payload.enabled:
         result = db.execute(
@@ -1214,16 +1419,33 @@ def set_close_only(payload: KillSwitchRequest, db: Db, _: Auth):
         cancellation_requested_count = int(result.rowcount or 0)
     db.commit()
     db.refresh(item)
-    return _control_view(item, cancellation_requested_count=cancellation_requested_count)
+    return _control_update_view(item, cancellation_requested_count)
 
 
-@app.post("/api/v1/kill-switch", response_model=TradingControlView)
+@app.post("/api/v1/kill-switch", response_model=TradingControlUpdateView)
 def set_kill_switch(payload: KillSwitchRequest, db: Db, _: Auth):
-    item = _control_flag(db)
-    item.kill_switch = payload.enabled
+    item = db.get(ControlFlag, 1, with_for_update=True) or _control_flag(db)
+    if item.kill_switch != payload.enabled:
+        item.kill_switch = payload.enabled
     if payload.enabled:
-        item.close_only = False
-    item.reason = payload.reason
+        if item.close_only:
+            item.close_only = False
+        if item.reason != payload.reason:
+            item.reason = payload.reason
+    elif not item.close_only and item.reason is not None:
+        item.reason = None
+    cancellation_requested_count = 0
+    if payload.enabled:
+        result = db.execute(update(Order).where(
+            Order.status.in_(NON_TERMINAL_ORDER_STATUSES),
+            Order.cancellation_requested.is_(False),
+        ).values(cancellation_requested=True))
+        cancellation_requested_count = int(result.rowcount or 0)
+        parents = list(db.scalars(select(CloseRequest).where(
+            CloseRequest.status.in_(ACTIVE_CLOSE_STATUSES)
+        ).with_for_update()).all())
+        for parent in parents:
+            cancel_parent(db, parent, "kill switch was enabled")
     db.commit()
     db.refresh(item)
-    return _control_view(item)
+    return _control_update_view(item, cancellation_requested_count)

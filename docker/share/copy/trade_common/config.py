@@ -42,6 +42,7 @@ class ExchangeSettings:
     maker_fee_rate: Decimal
     options: dict[str, Any] = field(default_factory=dict)
     market_data_max_age_seconds: float = 10.0
+    metadata_ttl_seconds: float = 300.0
 
 
 @dataclass(frozen=True)
@@ -76,8 +77,8 @@ class Settings:
         if market_data_max_age_seconds <= 0:
             raise ValueError("market_data_max_age_seconds must be positive")
         raw_exchanges = raw.get("exchanges")
-        if not isinstance(raw_exchanges, dict) or not raw_exchanges:
-            raise ValueError("exchanges must be a non-empty object")
+        if not isinstance(raw_exchanges, dict):
+            raise ValueError("exchanges must be an object")
 
         exchanges: dict[str, ExchangeSettings] = {}
         for exchange_id, exchange_raw in raw_exchanges.items():
@@ -91,13 +92,16 @@ class Settings:
             if adapter == "dydx" and exchange_id != "dydx":
                 raise ValueError("the dydx adapter must use exchange id 'dydx'")
             symbols = exchange_raw.get("symbols")
-            if not isinstance(symbols, list) or not symbols or any(not isinstance(item, str) or not item for item in symbols):
-                raise ValueError(f"exchange symbols must be a non-empty string list: {exchange_id}")
+            if not isinstance(symbols, list) or (not symbols and exchange_id != "bybit") or any(not isinstance(item, str) or not item for item in symbols):
+                raise ValueError(f"exchange symbols must be a string list: {exchange_id}")
             if any(item != item.strip() for item in symbols) or len(set(symbols)) != len(symbols):
                 raise ValueError(f"exchange symbols must be unique and contain no surrounding whitespace: {exchange_id}")
             options = exchange_raw.get("options", {})
             if not isinstance(options, dict):
                 raise ValueError(f"exchange options must be an object: {exchange_id}")
+            metadata_ttl_seconds = float(exchange_raw.get("metadata_ttl_seconds", 300))
+            if metadata_ttl_seconds <= 0:
+                raise ValueError(f"metadata_ttl_seconds must be positive: {exchange_id}")
             fees = exchange_raw.get("fees")
             if not isinstance(fees, dict):
                 raise ValueError(f"exchange fees must be configured: {exchange_id}")
@@ -113,6 +117,7 @@ class Settings:
                 maker_fee_rate=maker_fee_rate,
                 options=dict(options),
                 market_data_max_age_seconds=market_data_max_age_seconds,
+                metadata_ttl_seconds=metadata_ttl_seconds,
             )
 
         account_raw = raw.get("account", {})

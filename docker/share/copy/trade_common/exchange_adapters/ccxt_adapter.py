@@ -10,6 +10,7 @@ from typing import Any
 import ccxt
 
 from ..config import ExchangeSettings
+from ..market_rules import BYBIT_NATIVE_SYMBOL, MarketRuleError, bybit_local_canonical, positive_decimal
 from ..valuation import order_book_midpoint
 from .common import normalize_order_book
 
@@ -48,6 +49,8 @@ class CcxtAdapter:
         self._alias_to_canonical: dict[str, str] = {}
         self._canonical_to_exchange: dict[str, str] = {}
         self._instrument_cache: dict[str, dict[str, Any]] = {}
+        self._unsupported_aliases: set[str] = set()
+        self._markets_loaded = False
         self._metadata_loaded_at: float | None = None
         self._metadata_last_error: str | None = None
         self._price_cache: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -63,7 +66,8 @@ class CcxtAdapter:
     @property
     def metadata_ready(self) -> bool:
         age = self.metadata_age_seconds
-        return age is not None and age <= METADATA_STALE_MAX_SECONDS and bool(self._instrument_cache)
+        ttl = self.config.metadata_ttl_seconds if self.exchange_id == "bybit" else METADATA_STALE_MAX_SECONDS
+        return age is not None and age <= ttl and self._markets_loaded
 
     @property
     def metadata_last_error(self) -> str | None:
@@ -104,33 +108,91 @@ class CcxtAdapter:
         elif market.get("future"):
             contract_type = "linear_future" if market.get("linear") else "inverse_future" if market.get("inverse") else "future"
 
-        min_notional = _decimal(cost_limits.get("min"), positive=True)
-        if min_notional is None and lot_size.get("minNotionalValue") is not None:
-            min_notional = _decimal(lot_size.get("minNotionalValue"), positive=True)
+        invalid_fields: list[str] = []
 
-        max_market_qty = _decimal(lot_size.get("maxMktOrderQty"), positive=True)
-        if max_market_qty is None:
-            max_market_qty = _decimal(amount_limits.get("max"), positive=True)
+        def parsed(raw: Any, field: str) -> Decimal | None:
+            value = _decimal(raw, positive=True)
+            if raw is not None and value is None:
+                invalid_fields.append(field)
+            return value
+
+        min_notional_raw = cost_limits.get("min")
+        if min_notional_raw is None:
+            min_notional_raw = lot_size.get("minNotionalValue")
+        min_notional = parsed(min_notional_raw, "min_notional")
+        max_market_qty = parsed(lot_size.get("maxMktOrderQty"), "max_market_qty")
+        min_qty_raw = amount_limits.get("min")
+        if min_qty_raw is None:
+            min_qty_raw = lot_size.get("minOrderQty")
+        max_qty_raw = amount_limits.get("max")
+        if max_qty_raw is None:
+            max_qty_raw = lot_size.get("maxOrderQty")
+        qty_step_raw = precision.get("amount")
+        if qty_step_raw is None:
+            qty_step_raw = lot_size.get("qtyStep")
 
         return {
             "exchange_id": self.exchange_id,
             "symbol": canonical,
             "base_asset": market.get("base"),
             "quote_asset": market.get("quote"),
-            "settle_asset": market.get("settle") or market.get("quote"),
+            "settle_asset": market.get("settle") if self.exchange_id == "bybit" else market.get("settle") or market.get("quote"),
             "contract_type": contract_type,
             "contract_size": _decimal(market.get("contractSize"), positive=True),
-            "qty_step": self._precision_step(precision.get("amount")),
-            "min_qty": _decimal(amount_limits.get("min"), positive=True),
-            "max_qty": _decimal(amount_limits.get("max"), positive=True),
+            "qty_step": self._precision_step(qty_step_raw),
+            "min_qty": parsed(min_qty_raw, "min_qty"),
+            "max_qty": parsed(max_qty_raw, "max_qty"),
             "max_market_qty": max_market_qty,
             "price_step": self._precision_step(precision.get("price")),
             "min_notional": min_notional,
             "quantity_unit": market.get("base"),
             "status": status,
+            "_invalid_fields": invalid_fields,
         }
 
     def _replace_markets(self, markets: dict[str, dict[str, Any]]) -> None:
+        if self.exchange_id == "bybit":
+            if not markets:
+                raise RuntimeError("Bybit market catalog is empty")
+            aliases: dict[str, str] = {}
+            exchange_symbols: dict[str, str] = {}
+            instruments: dict[str, dict[str, Any]] = {}
+            known: set[str] = set()
+            for market in markets.values():
+                if not isinstance(market, dict):
+                    continue
+                market_aliases = {str(market.get("id") or ""), str(market.get("symbol") or "")}
+                known.update(alias for alias in market_aliases if alias)
+                if not (
+                    market.get("swap") is True
+                    and market.get("linear") is True
+                    and market.get("quote") == "USDT"
+                    and market.get("settle") == "USDT"
+                ):
+                    continue
+                canonical = str(market.get("id") or "")
+                exchange_symbol = str(market.get("symbol") or "")
+                if not exchange_symbol or BYBIT_NATIVE_SYMBOL.fullmatch(canonical) is None:
+                    continue
+                if canonical in exchange_symbols and exchange_symbols[canonical] != exchange_symbol:
+                    raise RuntimeError(f"ambiguous Bybit market id: {canonical}")
+                exchange_symbols[canonical] = exchange_symbol
+                instruments[canonical] = self._instrument(canonical, market)
+                for alias in market_aliases:
+                    if alias:
+                        previous = aliases.get(alias)
+                        if previous is not None and previous != canonical:
+                            raise RuntimeError(f"ambiguous Bybit market alias: {alias}")
+                        aliases[alias] = canonical
+            with self._lock:
+                self._alias_to_canonical = aliases
+                self._canonical_to_exchange = exchange_symbols
+                self._instrument_cache = instruments
+                self._unsupported_aliases = known - set(aliases)
+                self._metadata_loaded_at = time.monotonic()
+                self._metadata_last_error = None
+                self._markets_loaded = True
+            return
         configured = tuple(getattr(self.config, "symbols", ()) or ())
         if not configured:
             return
@@ -186,11 +248,13 @@ class CcxtAdapter:
             self._instrument_cache = instruments
             self._metadata_loaded_at = time.monotonic()
             self._metadata_last_error = None
+            self._markets_loaded = True
 
     def _refresh_metadata(self) -> None:
         with self._lock:
             age = self.metadata_age_seconds
-            if age is not None and age <= METADATA_TTL_SECONDS:
+            ttl = self.config.metadata_ttl_seconds if self.exchange_id == "bybit" else METADATA_TTL_SECONDS
+            if age is not None and age <= ttl:
                 return
             try:
                 try:
@@ -201,7 +265,8 @@ class CcxtAdapter:
             except Exception as exc:
                 self._metadata_last_error = str(exc)
                 age = self.metadata_age_seconds
-                if age is None or age > METADATA_STALE_MAX_SECONDS:
+                stale_limit = ttl if self.exchange_id == "bybit" else METADATA_STALE_MAX_SECONDS
+                if age is None or age > stale_limit:
                     raise
                 LOGGER.warning(
                     "using stale instrument metadata: exchange=%s cache_age_seconds=%.3f",
@@ -213,11 +278,20 @@ class CcxtAdapter:
     def resolve_symbol(self, raw_symbol: str) -> str:
         if raw_symbol != raw_symbol.strip():
             raise ValueError("symbol must not contain surrounding whitespace")
+        if self.exchange_id == "bybit" and bybit_local_canonical(raw_symbol) is None:
+            raise MarketRuleError("unknown_symbol", f"unknown Bybit symbol: {raw_symbol}", 422)
         self._refresh_metadata()
         canonical = self._alias_to_canonical.get(raw_symbol)
         if canonical is None:
+            if self.exchange_id == "bybit":
+                if raw_symbol in self._unsupported_aliases:
+                    raise MarketRuleError("unsupported_market", f"unsupported Bybit market: {raw_symbol}", 422)
+                raise MarketRuleError("unknown_symbol", f"unknown Bybit symbol: {raw_symbol}", 422)
             raise ValueError(f"symbol is not configured for exchange: {raw_symbol}")
         return canonical
+
+    def refresh_metadata(self) -> None:
+        self._refresh_metadata()
 
     def resolve_cached_symbol(self, raw_symbol: str) -> str | None:
         if raw_symbol != raw_symbol.strip():
@@ -234,7 +308,7 @@ class CcxtAdapter:
         if symbol is not None:
             canonical = self.resolve_symbol(symbol)
             return [dict(self._instrument_cache[canonical])]
-        return [dict(self._instrument_cache[item]) for item in self.config.symbols]
+        return [dict(self._instrument_cache[self.resolve_symbol(item)]) for item in self.config.symbols]
 
     @staticmethod
     def _ticker_value(ticker: dict[str, Any], key: str, *info_keys: str) -> Decimal | None:
@@ -250,41 +324,69 @@ class CcxtAdapter:
 
     def _fetch_price(self, canonical: str, exchange_symbol: str) -> dict[str, Any]:
         ticker: dict[str, Any] = {}
-        fetch_ticker = getattr(self.client, "fetch_ticker", None)
-        if callable(fetch_ticker):
-            try:
-                ticker = fetch_ticker(exchange_symbol) or {}
-            except Exception:
-                LOGGER.warning(
-                    "ticker lookup failed: exchange=%s symbol=%s",
-                    self.exchange_id,
-                    canonical,
-                    exc_info=True,
-                )
-        book = self.fetch_order_book(canonical)
+        mark_price = None
+        mark_observed_at = None
+        if self.exchange_id == "bybit":
+            mark_price, mark_observed_at, ticker = self._fetch_mark_ticker(canonical, exchange_symbol)
+        else:
+            fetch_ticker = getattr(self.client, "fetch_ticker", None)
+            if callable(fetch_ticker):
+                try:
+                    ticker = fetch_ticker(exchange_symbol) or {}
+                except Exception:
+                    LOGGER.warning("ticker lookup failed: exchange=%s symbol=%s", self.exchange_id, canonical, exc_info=True)
+        try:
+            book = self.fetch_order_book(canonical)
+        except Exception:
+            if self.exchange_id != "bybit":
+                raise
+            book = {}
         bids = book.get("bids") or []
         asks = book.get("asks") or []
         if not bids or not asks:
-            raise RuntimeError(f"price has no usable order book: {self.exchange_id} {canonical}")
-        bid = _decimal(bids[0][0], positive=True)
-        ask = _decimal(asks[0][0], positive=True)
-        if bid is None or ask is None or ask < bid:
-            raise RuntimeError(f"price has an invalid order book: {self.exchange_id} {canonical}")
-        mid_price, observed_at = order_book_midpoint(
-            book,
-            now=datetime.now(timezone.utc),
-            max_age_seconds=self.config.market_data_max_age_seconds,
-        )
+            if self.exchange_id != "bybit":
+                raise RuntimeError(f"price has no usable order book: {self.exchange_id} {canonical}")
+            bid = ask = mid_price = observed_at = None
+        else:
+            try:
+                bid = _decimal(bids[0][0], positive=True)
+                ask = _decimal(asks[0][0], positive=True)
+                if bid is None or ask is None or ask < bid:
+                    raise ValueError("invalid order book")
+                mid_price, observed_at = order_book_midpoint(
+                    book, now=datetime.now(timezone.utc),
+                    max_age_seconds=self.config.market_data_max_age_seconds,
+                )
+            except Exception:
+                if self.exchange_id != "bybit":
+                    raise
+                bid = ask = mid_price = observed_at = None
         return {
             "exchange_id": self.exchange_id,
             "symbol": canonical,
-            "mark_price": self._ticker_value(ticker, "mark", "markPrice", "mark_price"),
+            "mark_price": mark_price if self.exchange_id == "bybit" else self._ticker_value(ticker, "mark", "markPrice", "mark_price"),
+            "mark_observed_at": mark_observed_at,
             "last_price": self._ticker_value(ticker, "last", "lastPrice", "last_price"),
             "bid_price": bid,
             "ask_price": ask,
             "mid_price": mid_price,
             "observed_at": observed_at,
         }
+
+    def _fetch_mark_ticker(self, canonical: str, exchange_symbol: str) -> tuple[Decimal, datetime, dict[str, Any]]:
+        try:
+            ticker = self.client.fetch_ticker(exchange_symbol) or {}
+            mark = positive_decimal(self._ticker_value(ticker, "mark", "markPrice", "mark_price"))
+            if mark is None:
+                raise ValueError("Mark Price is missing or invalid")
+            return mark, datetime.now(timezone.utc), ticker
+        except Exception as exc:
+            raise MarketRuleError("mark_price_unavailable", f"fresh Mark Price is unavailable for {canonical}", 503) from exc
+
+    def fetch_mark_price(self, symbol: str) -> tuple[Decimal, datetime]:
+        canonical, exchange_symbol = self._exchange_symbol(symbol)
+        mark, observed_at, _ = self._fetch_mark_ticker(canonical, exchange_symbol)
+        return mark, observed_at
 
     def fetch_prices(self, symbols: list[str] | tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         requested = list(symbols) if symbols is not None else list(self.config.symbols)
@@ -294,7 +396,7 @@ class CcxtAdapter:
             result: list[dict[str, Any]] = []
             for canonical in resolved:
                 cached = self._price_cache.get(canonical)
-                if cached is not None and now - cached[0] <= PRICE_TTL_SECONDS:
+                if self.exchange_id != "bybit" and cached is not None and now - cached[0] <= PRICE_TTL_SECONDS:
                     result.append(dict(cached[1]))
                     continue
                 price = self._fetch_price(canonical, self._canonical_to_exchange[canonical])

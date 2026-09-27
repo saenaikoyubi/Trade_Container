@@ -9,6 +9,9 @@ const state = {
   fillCursor: null,
   activeTab: "orders",
   selectedOrderId: null,
+  orderFillCursor: null,
+  activeCloseRequestId: null,
+  closePollTimer: null,
   control: {
     kill_switch: false,
     close_only: false,
@@ -20,10 +23,12 @@ const elements = {
   modeBadge: document.querySelector("#mode-badge"),
   controlReason: document.querySelector("#control-reason"),
   controlToggle: document.querySelector("#close-only-toggle"),
+  killToggle: document.querySelector("#kill-switch-toggle"),
   controlMessage: document.querySelector("#control-message"),
   orderForm: document.querySelector("#order-form"),
   orderExchange: document.querySelector("#order-exchange"),
   orderSymbol: document.querySelector("#order-symbol"),
+  orderSymbolOptions: document.querySelector("#order-symbol-options"),
   orderSide: document.querySelector("#order-side"),
   orderType: document.querySelector("#order-type"),
   orderQuantity: document.querySelector("#order-quantity"),
@@ -50,6 +55,9 @@ const elements = {
   currentError: document.querySelector("#current-error"),
   currentBody: document.querySelector("#current-positions-body"),
   currentEmpty: document.querySelector("#current-positions-empty"),
+  closePanel: document.querySelector("#close-request-panel"),
+  closeStatus: document.querySelector("#close-request-status"),
+  closeCancel: document.querySelector("#close-request-cancel"),
   ordersTab: document.querySelector("#orders-tab"),
   fillsTab: document.querySelector("#fills-tab"),
   ordersPanel: document.querySelector("#orders-panel"),
@@ -65,6 +73,7 @@ const elements = {
   orderCancel: document.querySelector("#order-cancel"),
   orderDetail: document.querySelector("#order-detail"),
   orderFills: document.querySelector("#order-fills"),
+  orderFillsMore: document.querySelector("#order-fills-more"),
 };
 
 const statusLabels = {
@@ -225,6 +234,9 @@ function renderControl() {
     ? "Close-onlyを解除"
     : "Close-onlyを有効化";
   elements.controlToggle.disabled = state.control.kill_switch;
+  elements.killToggle.textContent = state.control.kill_switch
+    ? "Kill Switchを解除"
+    : "Kill Switchを有効化";
   elements.controlReason.value = state.control.reason || "";
   elements.orderSubmit.disabled = state.control.kill_switch;
   elements.orderReduceOnly.checked = state.control.close_only || elements.orderReduceOnly.checked;
@@ -273,13 +285,41 @@ async function setCloseOnly() {
   }
 }
 
+async function setKillSwitch() {
+  const enabled = !state.control.kill_switch;
+  const action = enabled ? "有効化" : "解除";
+  if (!window.confirm(`Kill Switchを${action}します。よろしいですか？`)) return;
+  elements.killToggle.disabled = true;
+  try {
+    state.control = await postJson("/ui-api/kill-switch", {
+      enabled,
+      reason: elements.controlReason.value.trim() || null,
+    });
+    renderControl();
+    showOperation(
+      elements.controlMessage,
+      `Kill Switchを${action}しました。取消要求: ${Number(state.control.cancellation_requested_count || 0)}件`,
+      enabled ? "error" : "success",
+    );
+    await loadOrders(false);
+  } catch (error) {
+    showOperation(elements.controlMessage, error.message, "error");
+  } finally {
+    elements.killToggle.disabled = false;
+  }
+}
+
 function updateOrderSymbols() {
   const selected = state.exchanges.find((item) => item.exchange_id === elements.orderExchange.value);
   const symbols = selected?.symbols || [];
-  elements.orderSymbol.innerHTML = symbols.length
-    ? symbols.map((symbol) => `<option value="${escapeHtml(symbol)}">${escapeHtml(symbol)}</option>`).join("")
-    : '<option value="">取引所を先に選択</option>';
-  elements.orderSymbol.disabled = symbols.length === 0;
+  elements.orderSymbolOptions.innerHTML = symbols.map((symbol) => (
+    `<option value="${escapeHtml(symbol)}"></option>`
+  )).join("");
+  elements.orderSymbol.value = symbols[0] || "";
+  elements.orderSymbol.disabled = !selected;
+  elements.orderSymbol.placeholder = selected?.exchange_id === "bybit"
+    ? "BTCUSDT または BTC/USDT:USDT"
+    : selected ? "銘柄を入力" : "取引所を先に選択";
 }
 
 async function loadExchanges() {
@@ -359,7 +399,7 @@ function orderPayload() {
   const payload = {
     request_id: requestId("manual"),
     exchange_id: elements.orderExchange.value,
-    symbol: elements.orderSymbol.value,
+    symbol: elements.orderSymbol.value.trim(),
     side: elements.orderSide.value,
     order_type: elements.orderType.value,
     quantity: elements.orderQuantity.value,
@@ -429,7 +469,7 @@ function renderCurrentPositions() {
     const pnlClass = Number.isFinite(pnl) && pnl > 0 ? "positive" : Number.isFinite(pnl) && pnl < 0 ? "negative" : "";
     const currentPrice = position.valuation_status === "ok"
       ? formatNumber(position.current_price)
-      : `<span class="valuation-unavailable" title="${escapeHtml(position.valuation_error || "価格を取得できませんでした")}">取得失敗</span>`;
+      : `<span class="valuation-unavailable" title="${escapeHtml(position.valuation_detail || "価格を取得できませんでした")}">取得失敗</span>`;
     return `
       <tr>
         <td>
@@ -498,13 +538,60 @@ async function closePositions(exchangeId, symbol = null) {
   };
   if (symbol) payload.symbol = symbol;
   const result = await postJson("/ui-api/positions/close", payload);
+  state.activeCloseRequestId = result.request_id;
+  window.sessionStorage.setItem("activeCloseRequestId", result.request_id);
+  renderCloseRequest(result);
   showOperation(
     elements.orderMessage,
-    `全決済注文を${result.items.length}件受け付けました。`,
+    `全決済処理 ${result.request_id} を受け付けました。子注文: ${result.items.length}件。`,
     "warning",
   );
   await loadOrders(false);
   window.setTimeout(() => loadCurrentPositions(), 1200);
+}
+
+const terminalCloseStatuses = new Set(["completed", "canceled", "failed"]);
+
+function renderCloseRequest(result) {
+  elements.closePanel.hidden = false;
+  const remaining = (result.positions || []).map((item) => (
+    `${item.symbol}: ${formatNumber(item.remaining_position_quantity)} (${item.status})`
+  )).join(" / ");
+  elements.closeStatus.textContent = `全決済 ${result.request_id} — ${result.status}${remaining ? ` — 残建玉 ${remaining}` : ""}${result.detail ? ` — ${result.detail}` : ""}`;
+  elements.closeCancel.hidden = terminalCloseStatuses.has(result.status) || result.status === "canceling";
+  if (state.closePollTimer) window.clearTimeout(state.closePollTimer);
+  if (!terminalCloseStatuses.has(result.status)) {
+    state.closePollTimer = window.setTimeout(pollCloseRequest, 2000);
+  } else {
+    state.closePollTimer = null;
+    window.sessionStorage.removeItem("activeCloseRequestId");
+    loadCurrentPositions();
+  }
+}
+
+async function pollCloseRequest() {
+  if (!state.activeCloseRequestId) return;
+  try {
+    const result = await fetchJson(`/ui-api/close-requests/${encodeURIComponent(state.activeCloseRequestId)}`);
+    renderCloseRequest(result);
+  } catch (error) {
+    elements.closeStatus.textContent = `全決済の状態取得に失敗しました: ${error.message}`;
+    state.closePollTimer = window.setTimeout(pollCloseRequest, 5000);
+  }
+}
+
+async function cancelActiveCloseRequest() {
+  if (!state.activeCloseRequestId) return;
+  if (!window.confirm("この全決済処理を取り消しますか？")) return;
+  elements.closeCancel.disabled = true;
+  try {
+    const result = await postJson(`/ui-api/close-requests/${encodeURIComponent(state.activeCloseRequestId)}/cancel`);
+    renderCloseRequest(result);
+  } catch (error) {
+    elements.closeStatus.textContent = error.message;
+  } finally {
+    elements.closeCancel.disabled = false;
+  }
 }
 
 function renderOrders() {
@@ -594,20 +681,38 @@ async function openOrderDetail(orderId) {
   const order = state.orders.find((item) => item.id === orderId);
   if (!order) return;
   state.selectedOrderId = order.id;
+  state.orderFillCursor = null;
   elements.orderDetail.innerHTML = orderDetailMarkup(order);
   updateCancelButton(order);
   elements.orderFills.innerHTML = '<p class="related-empty">約定を読み込み中…</p>';
+  elements.orderFillsMore.hidden = true;
   elements.dialog.showModal();
+  await loadOrderFills(false);
+}
+
+async function loadOrderFills(append) {
+  const orderId = state.selectedOrderId;
+  if (!orderId) return;
   try {
-    const fills = await fetchJson(`/ui-api/orders/${encodeURIComponent(order.id)}/fills`);
-    elements.orderFills.innerHTML = fills.length ? fills.map((fill) => `
+    const params = new URLSearchParams({ limit: "100" });
+    if (append && state.orderFillCursor) params.set("cursor", state.orderFillCursor);
+    const page = await fetchJson(`/ui-api/orders/${encodeURIComponent(orderId)}/fills?${params}`);
+    if (state.selectedOrderId !== orderId) return;
+    const markup = page.items.map((fill) => `
       <div class="related-fill">
         <span><strong>${escapeHtml(sideLabel(fill.side))}</strong> ${escapeHtml(formatDateTime(fill.executed_at))}</span>
         <span>${formatNumber(fill.quantity)} × ${formatNumber(fill.price)}</span>
         <span>手数料 ${formatNumber(fill.fee)}</span>
-      </div>`).join("") : '<p class="related-empty">この注文には約定がありません。</p>';
+      </div>`).join("");
+    elements.orderFills.innerHTML = append
+      ? elements.orderFills.innerHTML + markup
+      : markup || '<p class="related-empty">この注文には約定がありません。</p>';
+    state.orderFillCursor = page.next_cursor;
+    elements.orderFillsMore.hidden = !state.orderFillCursor;
   } catch (error) {
-    elements.orderFills.innerHTML = `<p class="related-empty">${escapeHtml(error.message)}</p>`;
+    if (state.selectedOrderId === orderId) {
+      elements.orderFills.innerHTML = `<p class="related-empty">${escapeHtml(error.message)}</p>`;
+    }
   }
 }
 
@@ -638,6 +743,8 @@ elements.orderType.addEventListener("change", () => {
   if (!limit) elements.orderLimitPrice.value = "";
 });
 elements.controlToggle.addEventListener("click", setCloseOnly);
+elements.killToggle.addEventListener("click", setKillSwitch);
+elements.closeCancel.addEventListener("click", cancelActiveCloseRequest);
 
 elements.form.addEventListener("submit", (event) => {
   event.preventDefault();
@@ -709,6 +816,14 @@ elements.ordersBody.addEventListener("keydown", (event) => {
 });
 
 elements.orderCancel.addEventListener("click", cancelSelectedOrder);
+elements.orderFillsMore.addEventListener("click", async () => {
+  elements.orderFillsMore.disabled = true;
+  try {
+    await loadOrderFills(true);
+  } finally {
+    elements.orderFillsMore.disabled = false;
+  }
+});
 elements.dialogClose.addEventListener("click", () => elements.dialog.close());
 elements.dialog.addEventListener("click", (event) => {
   if (event.target === elements.dialog) elements.dialog.close();
@@ -724,6 +839,8 @@ async function initialize() {
     showError(error instanceof Error ? error.message : "初期データを取得できませんでした。");
   }
   await loadAll();
+  state.activeCloseRequestId = window.sessionStorage.getItem("activeCloseRequestId");
+  if (state.activeCloseRequestId) pollCloseRequest();
 }
 
 initialize();

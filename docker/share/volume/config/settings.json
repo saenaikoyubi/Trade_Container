@@ -5,6 +5,7 @@
       "options": {
         "defaultType": "linear"
       },
+      "metadata_ttl_seconds": 300,
       "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
       "fees": {
         "maker": "0.0002",

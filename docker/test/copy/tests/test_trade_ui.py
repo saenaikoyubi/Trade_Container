@@ -144,3 +144,36 @@ def test_ui_contains_trading_controls_without_chart():
     assert "Close-onlyを有効化" in page.text
     assert "表示取引所を全決済" in page.text
     assert "pnl-chart" not in page.text
+
+
+def test_ui_proxies_close_parent_kill_switch_and_fill_page(monkeypatch):
+    import trade_ui_service.main as ui
+
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"items": [], "next_cursor": None})
+
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(ui, "_api_token", lambda: "server-only-token")
+    monkeypatch.setattr(
+        ui.httpx, "AsyncClient",
+        lambda **kwargs: real_async_client(transport=httpx.MockTransport(handler), timeout=kwargs.get("timeout")),
+    )
+
+    with TestClient(ui.app) as client:
+        fills = client.get("/ui-api/orders/order-1/fills?cursor=next&limit=50&ignored=1")
+        parent = client.get("/ui-api/close-requests/close-1")
+        cancel = client.post("/ui-api/close-requests/close-1/cancel")
+        kill = client.post("/ui-api/kill-switch", json={"enabled": True, "reason": "test"})
+
+    assert all(response.status_code == 200 for response in (fills, parent, cancel, kill))
+    assert [request.url.path for request in seen] == [
+        "/api/v1/orders/order-1/fills",
+        "/api/v1/close-requests/close-1",
+        "/api/v1/close-requests/close-1/cancel",
+        "/api/v1/kill-switch",
+    ]
+    assert dict(seen[0].url.params) == {"cursor": "next", "limit": "50"}
+    assert json.loads(seen[3].read()) == {"enabled": True, "reason": "test"}

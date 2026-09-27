@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -9,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from trade_common.config import AccountSettings, ExchangeSettings, Settings
 from trade_common.models import Base, DailyPnl, Fill, Order, Position
+from trade_common.runner import PaperExecutor
 from trade_common.risk import validate_instrument_quantity
 from trade_common.valuation import ValuationError, calculate_account_balance
 
@@ -78,6 +80,7 @@ class FakeAdapter:
                 "exchange_id": "bybit",
                 "symbol": self.resolve_symbol(symbol),
                 "mark_price": Decimal("1100"),
+                "mark_observed_at": datetime.now(timezone.utc),
                 "last_price": Decimal("1100"),
                 "bid_price": Decimal("1099"),
                 "ask_price": Decimal("1101"),
@@ -86,6 +89,16 @@ class FakeAdapter:
             }
             for symbol in requested
         ]
+
+    def fetch_order_book(self, symbol):
+        self.resolve_symbol(symbol)
+        if self.fail_prices:
+            raise RuntimeError("price failure")
+        return {
+            "bids": [["1099", "10"]], "asks": [["1101", "10"]],
+            "_received_at": datetime.now(timezone.utc),
+            "_request_duration_seconds": 0.01,
+        }
 
     def close(self):
         return None
@@ -300,6 +313,174 @@ def test_full_close_dust_is_accepted(market_client, sessions):
         },
     )
     assert response.status_code == 202
+
+
+def test_bybit_close_request_splits_by_market_cap_and_can_be_canceled(market_client, sessions):
+    client, _adapter = market_client
+    with sessions() as session:
+        session.add(Position(
+            exchange_id="bybit", symbol="BTCUSDT",
+            quantity=Decimal("51"), average_entry_price=Decimal("1000"),
+        ))
+        session.commit()
+
+    created = client.post("/api/v1/positions/close", json={
+        "request_id": "split-close", "exchange_id": "bybit", "symbol": "BTC/USDT:USDT",
+    })
+    assert created.status_code == 202
+    assert created.json()["symbol"] == "BTCUSDT"
+    assert [Decimal(item["quantity"]) for item in created.json()["items"]] == [Decimal("50"), Decimal("1")]
+    assert all(item["reduce_only"] for item in created.json()["items"])
+
+    blocked = client.post("/api/v1/orders", json={
+        "request_id": "while-closing", "exchange_id": "bybit", "symbol": "BTCUSDT",
+        "side": "sell", "order_type": "market", "quantity": "1", "reduce_only": True,
+    })
+    assert blocked.status_code == 409
+
+    canceled = client.post("/api/v1/close-requests/split-close/cancel")
+    assert canceled.status_code == 202
+    assert canceled.json()["status"] == "canceling"
+    assert all(item["cancellation_requested"] for item in canceled.json()["items"])
+    looked_up = client.get("/api/v1/close-requests/split-close")
+    assert looked_up.json()["status"] == "canceling"
+
+
+def test_invalid_defined_max_qty_disables_new_orders(market_client):
+    client, adapter = market_client
+    original = adapter.fetch_instruments
+
+    def invalid_max_qty(symbol=None):
+        instruments = original(symbol)
+        instruments[0]["max_qty"] = Decimal("0")
+        return instruments
+
+    adapter.fetch_instruments = invalid_max_qty
+    instrument = client.get("/api/v1/instruments?exchange_id=bybit&symbol=BTCUSDT")
+    assert instrument.status_code == 200
+    assert instrument.json()[0]["new_or_increase_allowed"] is False
+    assert instrument.json()[0]["new_or_increase_reason_code"] == "instrument_metadata_invalid"
+
+    order = client.post("/api/v1/orders", json={
+        "request_id": "invalid-max", "exchange_id": "bybit", "symbol": "BTCUSDT",
+        "side": "buy", "order_type": "market", "quantity": "1",
+    })
+    assert order.status_code == 503
+    assert order.json()["reason_code"] == "instrument_metadata_invalid"
+
+
+def test_empty_bybit_defaults_still_allow_explicit_symbol(market_client):
+    import trade_api_service.main as api
+
+    client, _adapter = market_client
+    config = replace(CONFIG, exchanges={"bybit": replace(BYBIT, symbols=())})
+
+    class EmptyDefaultsAdapter(FakeAdapter):
+        def fetch_instruments(self, symbol=None):
+            return [] if symbol is None else super().fetch_instruments(symbol)
+
+        def fetch_prices(self, symbols=None):
+            return [] if symbols is None else super().fetch_prices(symbols)
+
+    api.app.state.runtime_config = config
+    api.app.state.adapter_pool = FakePool(config, EmptyDefaultsAdapter())
+
+    assert client.get("/api/v1/exchanges").json()[0]["symbols"] == []
+    assert client.get("/api/v1/instruments?exchange_id=bybit").json() == []
+    assert client.get("/api/v1/instruments?exchange_id=bybit&symbol=BTCUSDT").status_code == 200
+    assert client.get("/api/v1/prices?exchange_id=bybit&symbols=BTCUSDT").status_code == 200
+    order = client.post("/api/v1/orders", json={
+        "request_id": "explicit-btc", "exchange_id": "bybit", "symbol": "BTCUSDT",
+        "side": "buy", "order_type": "market", "quantity": "0.01",
+    })
+    assert order.status_code == 202
+
+
+def test_inactive_bybit_position_closes_at_fresh_mark_without_book(market_client, sessions):
+    client, adapter = market_client
+    original = adapter.fetch_instruments
+
+    def inactive_instrument(symbol=None):
+        items = original(symbol)
+        items[0]["status"] = "inactive"
+        return items
+
+    adapter.fetch_instruments = inactive_instrument
+    adapter.fetch_order_book = lambda _symbol: (_ for _ in ()).throw(RuntimeError("no book"))
+    with sessions() as session:
+        session.add(Position(
+            exchange_id="bybit", symbol="BTCUSDT",
+            quantity=Decimal("1"), average_entry_price=Decimal("1000"),
+        ))
+        session.commit()
+
+    created = client.post("/api/v1/positions/close", json={
+        "request_id": "stopped-close", "exchange_id": "bybit", "symbol": "BTCUSDT",
+    })
+    assert created.status_code == 202
+    worker = PaperExecutor(
+        CONFIG, adapters=FakePool(CONFIG, adapter), sessions=sessions,
+        now=lambda: datetime.now(timezone.utc),
+    )
+    assert worker.process_once()
+
+    completed = client.get("/api/v1/close-requests/stopped-close")
+    assert completed.json()["status"] == "completed"
+    with sessions() as session:
+        assert session.scalar(select(Position).where(Position.symbol == "BTCUSDT")).quantity == Decimal("0")
+        assert session.scalar(select(Fill).where(Fill.symbol == "BTCUSDT")).price == Decimal("1100")
+
+
+def test_kill_switch_cancels_close_without_recording_fill(market_client, sessions):
+    client, adapter = market_client
+    with sessions() as session:
+        session.add(Position(
+            exchange_id="bybit", symbol="BTCUSDT",
+            quantity=Decimal("1"), average_entry_price=Decimal("1000"),
+        ))
+        session.commit()
+    created = client.post("/api/v1/positions/close", json={
+        "request_id": "kill-close", "exchange_id": "bybit", "symbol": "BTCUSDT",
+    })
+    assert created.status_code == 202
+    halted = client.post("/api/v1/kill-switch", json={"enabled": True, "reason": "test"})
+    assert halted.status_code == 200
+    assert halted.json()["cancellation_requested_count"] == 1
+
+    worker = PaperExecutor(
+        CONFIG, adapters=FakePool(CONFIG, adapter), sessions=sessions,
+        now=lambda: datetime.now(timezone.utc),
+    )
+    assert worker.process_once()
+    assert client.get("/api/v1/close-requests/kill-close").json()["status"] == "canceled"
+    with sessions() as session:
+        assert session.scalar(select(Position).where(Position.symbol == "BTCUSDT")).quantity == Decimal("1")
+        assert list(session.scalars(select(Fill)).all()) == []
+
+
+def test_removed_exchange_fails_affected_close_target(market_client, sessions):
+    client, adapter = market_client
+    with sessions() as session:
+        session.add(Position(
+            exchange_id="bybit", symbol="BTCUSDT",
+            quantity=Decimal("1"), average_entry_price=Decimal("1000"),
+        ))
+        session.commit()
+    created = client.post("/api/v1/positions/close", json={
+        "request_id": "removed-exchange-close", "exchange_id": "bybit", "symbol": "BTCUSDT",
+    })
+    assert created.status_code == 202
+
+    after_removal = replace(CONFIG, exchanges={})
+    worker = PaperExecutor(
+        after_removal, adapters=FakePool(after_removal, adapter), sessions=sessions,
+        now=lambda: datetime.now(timezone.utc),
+    )
+    assert worker.process_once()
+    parent = client.get("/api/v1/close-requests/removed-exchange-close").json()
+    assert parent["status"] == "failed"
+    assert parent["positions"][0]["reason_code"] == "exchange_not_configured"
+    assert parent["items"][0]["status"] == "rejected"
 
 
 def test_balance_api_is_fail_fast_and_health_marks_paper_mode(market_client, sessions):
