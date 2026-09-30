@@ -215,6 +215,9 @@ class PaperExecutor:
                     session, order, mark_price, self.config, exchange_config,
                     instrument, execution_price=mark_price, valuation_price=mark_price,
                 )
+                if self._defer_if_mark_stale(session, order, parent, target, instrument, mark_price, mark_observed_at):
+                    session.commit()
+                    return
                 if not decision.allowed:
                     self._handle_decision(session, order, parent, target, instrument, decision)
                 else:
@@ -267,6 +270,9 @@ class PaperExecutor:
                 execution_price=execution_price,
                 valuation_price=mark_price,
             )
+            if self._defer_if_mark_stale(session, order, parent, target, instrument, mark_price, mark_observed_at):
+                session.commit()
+                return
             if not decision.allowed:
                 self._handle_decision(session, order, parent, target, instrument, decision)
                 session.commit()
@@ -367,6 +373,23 @@ class PaperExecutor:
             max_age_seconds=self.config.market_data_max_age_seconds,
         )
         return price
+
+    def _defer_if_mark_stale(self, session, order, parent, target, instrument, mark_price, observed_at) -> bool:
+        if mark_price is None:
+            return False
+        if observed_at is None:
+            reason = "Mark Price has no timestamp"
+        else:
+            age_seconds = (self.now() - observed_at).total_seconds()
+            if age_seconds > self.config.market_data_max_age_seconds:
+                reason = "Mark Price is stale"
+            elif age_seconds < -2:
+                reason = "Mark Price timestamp is too far in the future"
+            else:
+                return False
+        self._defer(order, reason)
+        self._after_close_child(session, order, parent, target, instrument, "mark_price_unavailable")
+        return True
 
     def _paper_execute(
         self,

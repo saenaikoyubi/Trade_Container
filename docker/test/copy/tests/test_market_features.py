@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from dataclasses import replace
 from decimal import Decimal
 
@@ -556,6 +556,75 @@ def test_inactive_bybit_position_closes_at_fresh_mark_without_book(market_client
     with sessions() as session:
         assert session.scalar(select(Position).where(Position.symbol == "BTCUSDT")).quantity == Decimal("0")
         assert session.scalar(select(Fill).where(Fill.symbol == "BTCUSDT")).price == Decimal("1100")
+
+
+@pytest.mark.parametrize("market_status", ["active", "inactive"])
+def test_executor_defers_mark_that_stales_before_fill_and_retries(sessions, market_status):
+    fetched_at = datetime.now(timezone.utc)
+    clock = {"now": fetched_at}
+
+    class DelayedMarkAdapter(FakeAdapter):
+        first_fetch = True
+
+        def fetch_instruments(self, symbol=None):
+            instruments = super().fetch_instruments(symbol)
+            instruments[0]["status"] = market_status
+            return instruments
+
+        def fetch_prices(self, symbols=None):
+            prices = super().fetch_prices(symbols)
+            for price in prices:
+                price["mark_observed_at"] = clock["now"]
+            if self.first_fetch:
+                self.first_fetch = False
+                clock["now"] += timedelta(seconds=CONFIG.market_data_max_age_seconds + 1)
+            return prices
+
+        def fetch_order_book(self, symbol):
+            book = super().fetch_order_book(symbol)
+            book["_received_at"] = clock["now"]
+            book["_market_data_id"] = "fresh-book"
+            return book
+
+    with sessions() as session:
+        if market_status == "inactive":
+            session.add(Position(
+                exchange_id="bybit", symbol="BTCUSDT",
+                quantity=Decimal("1"), average_entry_price=Decimal("1000"),
+            ))
+        order = Order(
+            request_id=f"stale-mark-{market_status}",
+            exchange_id="bybit", symbol="BTCUSDT",
+            side="sell" if market_status == "inactive" else "buy",
+            order_type="market", quantity=Decimal("1"),
+            reduce_only=market_status == "inactive", next_attempt_at=fetched_at,
+        )
+        session.add(order)
+        session.commit()
+        order_id = order.id
+
+    worker = PaperExecutor(
+        CONFIG, adapters=FakePool(CONFIG, DelayedMarkAdapter()), sessions=sessions,
+        now=lambda: clock["now"],
+    )
+    assert worker.process_once()
+    with sessions() as session:
+        order = session.get(Order, order_id)
+        assert order.status == "pending"
+        assert order.retry_count == 1
+        assert order.rejection_reason == "Mark Price is stale"
+        assert session.scalars(select(Fill).where(Fill.order_id == order_id)).all() == []
+        if market_status == "inactive":
+            assert session.scalar(select(Position).where(Position.symbol == "BTCUSDT")).quantity == Decimal("1")
+        order.next_attempt_at = clock["now"]
+        session.commit()
+
+    assert worker.process_once()
+    with sessions() as session:
+        order = session.get(Order, order_id)
+        assert order.status == "filled"
+        assert order.retry_count == 0
+        assert len(session.scalars(select(Fill).where(Fill.order_id == order_id)).all()) == 1
 
 
 def test_kill_switch_cancels_close_without_recording_fill(market_client, sessions):

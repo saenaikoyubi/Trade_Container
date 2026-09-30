@@ -64,6 +64,7 @@ stateDiagram-v2
 - 注文ごとに `exchange_id` に応じた公開注文板（買い: Ask / 売り: Bid）を取得（Bybit 等の表記揺れはアダプターが自動正規化）。
 - データ経過時間が `market_data_max_age_seconds` を超える場合、板が空の場合、またはいずれかの板段の価格・数量が非正値・非有限値か並び順に違反する場合は次回ループへ延期（指数バックオフ: 2s -> 4s -> ... -> 最大60s）。
 - Bybit の`inactive`/`unknown`対象市場のReduce-only Market縮小・決済では、Mark Priceを取得できれば板がなくてもその価格でPaper約定させます。Mark Priceを取得できなければ建玉を保持して再試行します。
+- ExecutorはMark Priceを使う注文で、状態ロック後、判定結果の適用前に取得時刻を再確認します。経過時間が`market_data_max_age_seconds`を超える場合、または取得時刻が現在より2秒超未来の場合は約定を記録せず、注文を延期して新しいMark Priceで再試行します。
 
 ### 成行注文（Market）
 - 最良気配から価格優先で数量を消費。
